@@ -1,5 +1,6 @@
 """Regression tests for the explicit deployment artifact."""
 
+import json
 import os
 import pathlib
 import re
@@ -88,6 +89,16 @@ class StageAssetsTests(unittest.TestCase):
             stream.write("\n/* changed */\n")
         self._stage()
         self.assertNotEqual(self._cache_version(), first)
+
+    def test_pwa_manifest_starts_at_canonical_root(self):
+        self._stage()
+
+        manifest = json.loads(
+            (self.root / "dist/manifest.webmanifest").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(manifest["start_url"], "./")
+        self.assertEqual(manifest["scope"], "./")
 
     def test_missing_required_asset_fails_before_replacing_dist(self):
         self._stage()

@@ -2,7 +2,7 @@
   "name": "bunnysplit",
   "short_name": "bunnysplit",
   "description": "Split bills fairly. Add people, log items, settle up — all local.",
-  "start_url": "./index.html",
+  "start_url": "./",
   "scope": "./",
   "id": "/bunnysplit/",
   "display": "standalone",
