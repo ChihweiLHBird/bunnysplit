@@ -327,6 +327,46 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual([p.name for p in ui._state.people], ["A"])
         self.assertIn("Imported with 1 issue(s)", data_error.textContent)
 
+    def test_import_non_object_json_is_rejected_without_wiping_state(self):
+        data_error = FakeElement()
+        ui = load_ui(FakePill(), {"#data-error": data_error})
+        original = AppState(people=[Person("p1", "Keep me")])
+        ui._state = original
+        # Valid JSON, but not a bunnysplit backup shape (a bare array).
+        field = FakeFileInput([FakeFile(text_value=json.dumps([1, 2, 3]))])
+        event = types.SimpleNamespace(target=field)
+
+        ui.on_import_file_change(event)
+
+        self.assertIs(ui._state, original)
+        self.assertEqual([p.name for p in ui._state.people], ["Keep me"])
+        self.assertIn("expected a JSON object", data_error.textContent)
+
+    def test_import_destroys_proxies_after_promise_settles(self):
+        ui = load_ui(FakePill(), {"#data-error": FakeElement()})
+        ui._state = AppState()
+        destroyed = []
+
+        class TrackedProxy:
+            def __init__(self, fn):
+                self.fn = fn
+
+            def __call__(self, *args):
+                return self.fn(*args)
+
+            def destroy(self):
+                destroyed.append(self)
+
+        ui.create_proxy = TrackedProxy
+        field = FakeFileInput([FakeFile(text_value=json.dumps({
+            "people": [], "items": [],
+        }))])
+        event = types.SimpleNamespace(target=field)
+
+        ui.on_import_file_change(event)
+
+        self.assertEqual(len(destroyed), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

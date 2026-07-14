@@ -640,7 +640,10 @@ def _make_remove_item(iid):
 # ---------- import / export ----------
 
 def on_export_state(event):
-    data = json.dumps(_state.to_dict(), indent=2)
+    # No indent kwarg: MicroPython's json.dumps doesn't accept it, and this
+    # module runs as MicroPython in the browser (see index.html's <script
+    # type="mpy">), not CPython.
+    data = json.dumps(_state.to_dict())
     href = "data:application/json;charset=utf-8," + window.encodeURIComponent(data)
     link = _el("a")
     link.href = href
@@ -661,6 +664,9 @@ def _apply_imported_json(text):
     except Exception:
         err.textContent = "That file isn't valid JSON."
         return
+    # AppState.from_dict() treats a non-object top level as "no data" and
+    # returns an empty state — applying that would silently wipe the
+    # existing bill. Reject it here instead of overwriting current data.
     if not isinstance(raw, dict):
         err.textContent = "Import failed: top-level value must be a JSON object."
         return
@@ -688,18 +694,36 @@ def on_import_file_change(event):
         return
     file = files.item(0)
 
+    proxies = []
+
+    def _cleanup():
+        for p in proxies:
+            try:
+                p.destroy()
+            except Exception:
+                pass
+
     def _ok(text):
-        _apply_imported_json(text)
+        try:
+            _apply_imported_json(text)
+        finally:
+            _cleanup()
 
     def _fail(e):
-        window.console.warn("bunnysplit: import read failed: " + str(e))
-        err.textContent = "Could not read the selected file."
+        try:
+            window.console.warn("bunnysplit: import read failed: " + str(e))
+            err.textContent = "Could not read the selected file."
+        finally:
+            _cleanup()
 
+    proxies.append(create_proxy(_ok))
+    proxies.append(create_proxy(_fail))
     try:
-        file.text().then(create_proxy(_ok), create_proxy(_fail))
+        file.text().then(*proxies)
     except Exception as e:
         window.console.warn("bunnysplit: import failed: " + str(e))
         err.textContent = "Could not read the selected file."
+        _cleanup()
     finally:
         # Reset so choosing the same file again still fires "change".
         field.value = ""
