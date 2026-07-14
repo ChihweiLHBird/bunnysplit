@@ -661,6 +661,9 @@ def _apply_imported_json(text):
     except Exception:
         err.textContent = "That file isn't valid JSON."
         return
+    if not isinstance(raw, dict):
+        err.textContent = "Import failed: top-level value must be a JSON object."
+        return
     issues = []
     new_state = AppState.from_dict(
         raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
