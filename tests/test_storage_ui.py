@@ -136,11 +136,84 @@ class FakePill:
         return self.label if selector == ".saved-label" else None
 
 
-def load_ui(pill):
+class FakeElement:
+    def __init__(self, tag=""):
+        self.tag = tag
+        self.children = []
+        self.appended = []
+        self.textContent = ""
+        self.className = ""
+        self.href = None
+        self.download = None
+        self.value = ""
+        self.click_count = 0
+
+    def appendChild(self, child):
+        self.children.append(child)
+        self.appended.append(child)
+
+    def removeChild(self, child):
+        self.children.remove(child)
+
+    def click(self):
+        self.click_count += 1
+
+
+class FakeDocument:
+    def __init__(self, extra_elements=None):
+        self.body = FakeElement("body")
+        self._extra = extra_elements or {}
+
+    def querySelector(self, selector):
+        return self._extra.get(selector)
+
+    def createElement(self, tag):
+        return FakeElement(tag)
+
+
+class FakePromise:
+    def __init__(self, value=None, error=None):
+        self._value = value
+        self._error = error
+
+    def then(self, on_ok, on_err):
+        if self._error is not None:
+            on_err(self._error)
+        else:
+            on_ok(self._value)
+
+
+class FakeFile:
+    def __init__(self, text_value=None, error=None):
+        self._text_value = text_value
+        self._error = error
+
+    def text(self):
+        return FakePromise(self._text_value, self._error)
+
+
+class FakeFileList:
+    def __init__(self, files):
+        self._files = files
+        self.length = len(files)
+
+    def item(self, index):
+        return self._files[index]
+
+
+class FakeFileInput:
+    def __init__(self, files):
+        self.files = FakeFileList(files)
+        self.value = "sentinel.json"
+
+
+def load_ui(pill, extra_elements=None):
+    elements = dict(extra_elements or {})
+    elements[".saved-pill"] = pill
     pyscript = types.ModuleType("pyscript")
-    pyscript.document = types.SimpleNamespace(
-        querySelector=lambda selector: pill if selector == ".saved-pill" else None)
-    pyscript.window = types.SimpleNamespace(console=FakeConsole())
+    pyscript.document = FakeDocument(elements)
+    pyscript.window = types.SimpleNamespace(
+        console=FakeConsole(), encodeURIComponent=lambda s: s)
     ffi = types.ModuleType("pyscript.ffi")
     ffi.create_proxy = lambda function: function
     with mock.patch.dict(
@@ -176,6 +249,83 @@ class UiBoundaryTests(unittest.TestCase):
         ui._seed_counter()
 
         self.assertEqual(ui._next_id("p"), "p3")
+
+
+class ImportExportTests(unittest.TestCase):
+    def test_export_state_builds_a_downloadable_json_link(self):
+        ui = load_ui(FakePill())
+        ui._state = AppState(
+            people=[Person("p1", "A")],
+            items=[Item("i1", "x", 100, "p1", ["p1"], {"mode": "equal"})],
+        )
+
+        ui.on_export_state(None)
+
+        body = ui.document.body
+        self.assertEqual(len(body.appended), 1)
+        link = body.appended[0]
+        self.assertEqual(link.download, "bunnysplit-export.json")
+        self.assertTrue(
+            link.href.startswith("data:application/json;charset=utf-8,"))
+        self.assertEqual(link.click_count, 1)
+        self.assertEqual(body.children, [])  # removed after triggering download
+        payload = json.loads(link.href.split(",", 1)[1])
+        self.assertEqual(payload, ui._state.to_dict())
+
+    def test_import_replaces_state_and_resets_id_counter(self):
+        data_error = FakeElement()
+        ui = load_ui(FakePill(), {"#data-error": data_error})
+        ui._state = AppState(people=[Person("old", "Stale")])
+        payload = json.dumps({
+            "people": [{"id": "p1", "name": "A"}],
+            "items": [{
+                "id": "i1", "description": "x", "amount_cents": 500,
+                "payer_id": "p1", "participant_ids": ["p1"],
+                "split": {"mode": "equal"},
+            }],
+        })
+        field = FakeFileInput([FakeFile(text_value=payload)])
+        event = types.SimpleNamespace(target=field)
+
+        ui.on_import_file_change(event)
+
+        self.assertEqual([p.name for p in ui._state.people], ["A"])
+        self.assertEqual(len(ui._state.items), 1)
+        self.assertEqual(data_error.textContent, "Imported successfully.")
+        self.assertEqual(field.value, "")  # cleared so re-picking refires change
+        self.assertEqual(ui._next_id("p"), "p2")  # counter reseeded, no clash
+
+    def test_import_invalid_json_reports_error_without_touching_state(self):
+        data_error = FakeElement()
+        ui = load_ui(FakePill(), {"#data-error": data_error})
+        original = AppState(people=[Person("p1", "Keep me")])
+        ui._state = original
+        field = FakeFileInput([FakeFile(text_value="{not json")])
+        event = types.SimpleNamespace(target=field)
+
+        ui.on_import_file_change(event)
+
+        self.assertIs(ui._state, original)
+        self.assertEqual(data_error.textContent, "That file isn't valid JSON.")
+
+    def test_import_partial_recovery_reports_issue_count(self):
+        data_error = FakeElement()
+        ui = load_ui(FakePill(), {"#data-error": data_error})
+        ui._state = AppState()
+        payload = json.dumps({
+            "people": [
+                {"id": "p1", "name": "A"},
+                {"id": "p1", "name": "duplicate"},
+            ],
+            "items": [],
+        })
+        field = FakeFileInput([FakeFile(text_value=payload)])
+        event = types.SimpleNamespace(target=field)
+
+        ui.on_import_file_change(event)
+
+        self.assertEqual([p.name for p in ui._state.people], ["A"])
+        self.assertIn("Imported with 1 issue(s)", data_error.textContent)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ Workspace design notes:
   stable across renders without storing them in the model.
 """
 
+import json
+
 from pyscript import document, window
 from pyscript.ffi import create_proxy
 
@@ -635,6 +637,71 @@ def _make_remove_item(iid):
     return handler
 
 
+# ---------- import / export ----------
+
+def on_export_state(event):
+    data = json.dumps(_state.to_dict(), indent=2)
+    href = "data:application/json;charset=utf-8," + window.encodeURIComponent(data)
+    link = _el("a")
+    link.href = href
+    link.download = "bunnysplit-export.json"
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+
+
+def on_import_click(event):
+    _qs("#import-file").click()
+
+
+def _apply_imported_json(text):
+    err = _qs("#data-error")
+    try:
+        raw = json.loads(text)
+    except Exception:
+        err.textContent = "That file isn't valid JSON."
+        return
+    issues = []
+    new_state = AppState.from_dict(
+        raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
+    _state.people = new_state.people
+    _state.items = new_state.items
+    _seed_counter()
+    if issues:
+        err.textContent = (
+            "Imported with %d issue(s) — some records were skipped or "
+            "adjusted; see console for details." % len(issues))
+    else:
+        err.textContent = "Imported successfully."
+    _persist_and_render()
+
+
+def on_import_file_change(event):
+    err = _qs("#data-error")
+    err.textContent = ""
+    field = event.target
+    files = field.files
+    if not files or files.length == 0:
+        return
+    file = files.item(0)
+
+    def _ok(text):
+        _apply_imported_json(text)
+
+    def _fail(e):
+        window.console.warn("bunnysplit: import read failed: " + str(e))
+        err.textContent = "Could not read the selected file."
+
+    try:
+        file.text().then(create_proxy(_ok), create_proxy(_fail))
+    except Exception as e:
+        window.console.warn("bunnysplit: import failed: " + str(e))
+        err.textContent = "Could not read the selected file."
+    finally:
+        # Reset so choosing the same file again still fires "change".
+        field.value = ""
+
+
 # ---------- entry ----------
 
 def _register_service_worker():
@@ -675,6 +742,9 @@ def start(state, storage_module):
     _qs("#item-amount").maxLength = MAX_AMOUNT_INPUT_LENGTH
     _on(_qs("#add-person"), "click", on_add_person, track=False)
     _on(_qs("#add-item"), "click", on_add_item, track=False)
+    _on(_qs("#export-state"), "click", on_export_state, track=False)
+    _on(_qs("#import-state"), "click", on_import_click, track=False)
+    _on(_qs("#import-file"), "change", on_import_file_change, track=False)
     parts = _qs("#participants")
     _on(parts, "focusin", _select_share_field, track=False)
     render_all()

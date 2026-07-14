@@ -92,6 +92,21 @@
           <p id="people-error" class="error" role="alert"></p>
         </div>
       </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Backup</h2>
+          <span class="desc">· save or restore your data</span>
+        </div>
+        <div class="panel-body">
+          <div class="row-add-person">
+            <button id="export-state" class="btn btn-secondary" type="button">Export JSON</button>
+            <button id="import-state" class="btn btn-secondary" type="button">Import JSON</button>
+            <input id="import-file" type="file" accept="application/json,.json" hidden aria-hidden="true" tabindex="-1">
+          </div>
+          <p id="data-error" class="error" role="alert"></p>
+        </div>
+      </div>
     </aside>
 
     <!-- ============ MAIN ============ -->
