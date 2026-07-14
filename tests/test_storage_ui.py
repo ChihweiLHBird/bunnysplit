@@ -340,7 +340,8 @@ class ImportExportTests(unittest.TestCase):
 
         self.assertIs(ui._state, original)
         self.assertEqual([p.name for p in ui._state.people], ["Keep me"])
-        self.assertIn("expected a JSON object", data_error.textContent)
+        self.assertIn("top-level value must be a JSON object",
+                      data_error.textContent)
 
     def test_import_destroys_proxies_after_promise_settles(self):
         ui = load_ui(FakePill(), {"#data-error": FakeElement()})
