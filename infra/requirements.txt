@@ -32,8 +32,9 @@ protobuf==6.33.6 \
     --hash=sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593
 pulumi==3.256.0 \
     --hash=sha256:ee6f018a628b9cc2b5e70b69e05a51965966a6c6d9e7429d698fc665525aaa58
-pulumi-cloudflare==6.17.0 \
-    --hash=sha256:eb82562d697e06ee09405a9d77675a7bf8652c39e66f6a9bde99b73b21596690
+pulumi-cloudflare==6.19.0 \
+    --hash=sha256:4c22d5fd60fb247b02a1eb9af75371a48e9d985a95fd96edaf9d1e7b38b10924 \
+    --hash=sha256:9b0f40b0047df38a019bcaf90161f5bae14a815eb160f1f4ae9ed0391369f9a5
 pyyaml==6.0.3 \
     --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5
 semver==3.0.4 \
