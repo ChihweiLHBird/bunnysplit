@@ -3,5 +3,5 @@
 #   uv pip compile --python-version 3.14 \
 #     --python-platform x86_64-manylinux_2_34 --only-binary=:all: \
 #     --generate-hashes requirements.in -o requirements.txt
-pulumi>=3.256.0,<4.0
+pulumi>=3.258.0,<4.0
 pulumi-cloudflare>=6.17,<7.0
