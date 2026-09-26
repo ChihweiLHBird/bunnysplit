@@ -14,6 +14,13 @@ MODE_UNEVEN = "uneven"
 # remainder exceed the participant count (IndexError) or overflow to inf.
 MAX_CENTS = 10 ** 11
 MAX_ID_LENGTH = 64
+# Supported bill size. Backup import rejects anything larger and the UI stops
+# adding at these limits, so every bill the app can build can be restored.
+# Measured under MicroPython 1.24: settle_up() is quadratic in people (2000
+# took 4.4 s) and each render walks every participant entry twice.
+MAX_PEOPLE = 200
+MAX_ITEMS = 1000
+MAX_PARTICIPANT_REFS = 20000
 
 
 def _warn_skip(kind, exc):

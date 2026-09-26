@@ -8,7 +8,8 @@ import types
 import unittest
 from unittest import mock
 
-from splitcore.model import AppState, Item, Person
+from splitcore.model import (
+    MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState, Item, Person)
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -162,6 +163,96 @@ class BackupFormatTests(unittest.TestCase):
         loads.assert_not_called()
         self.assertIn("too large", str(ctx.exception))
 
+    def test_long_unquoted_number_is_rejected_before_parsing(self):
+        # MicroPython converts a huge integer literal in quadratic time, so
+        # the digit run must be refused before json.loads() sees it. (CPython
+        # would reject >4300 digits itself, which hides the bug; 100 doesn't.)
+        text = '{"people": [], "items": [], "x": ' + "7" * 100 + "}"
+
+        with mock.patch.object(self.storage.json, "loads") as loads:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(text)
+
+        loads.assert_not_called()
+        self.assertIn("number too long", str(ctx.exception))
+
+    def test_digit_limit_is_the_longest_legal_integer_id(self):
+        limit = self.storage.MAX_NUMBER_DIGITS
+        ok = '{"people": [], "items": [], "x": ' + "7" * limit + "}"
+        too_long = '{"people": [], "items": [], "x": ' + "7" * (limit + 1) + "}"
+
+        self.storage.parse_backup(ok)
+        with self.assertRaises(ValueError):
+            self.storage.parse_backup(too_long)
+
+    def test_long_digit_runs_inside_strings_are_allowed(self):
+        text = json.dumps({
+            "people": [{"id": "p1", "name": 'say "hi" ' + "1" * 100}],
+            "items": [],
+        })
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(state.people[0].name, 'say "hi" ' + "1" * 100)
+        self.assertEqual(issues, [])
+
+    def test_escaped_backslash_before_a_quote_still_closes_the_string(self):
+        # "end\\" is the string end\ followed by a real closing quote, so
+        # the digits after it are an unquoted number.
+        text = (json.dumps({"people": [], "items": [], "n": "end\\"})[:-1]
+                + ', "x": ' + "1" * 100 + "}")
+
+        with self.assertRaises(ValueError) as ctx:
+            self.storage.parse_backup(text)
+
+        self.assertIn("number too long", str(ctx.exception))
+
+    def test_record_counts_are_limited_before_building_state(self):
+        people = [{"id": "p%d" % i, "name": "P%d" % i}
+                  for i in range(MAX_PEOPLE + 1)]
+        items = [{"id": "i%d" % i} for i in range(MAX_ITEMS + 1)]
+        cases = (
+            ({"people": people, "items": []}, "at most %d people" % MAX_PEOPLE),
+            ({"people": [], "items": items}, "at most %d items" % MAX_ITEMS),
+        )
+        for raw, message in cases:
+            with self.subTest(message=message):
+                with mock.patch.object(self.storage.AppState,
+                                       "from_dict") as from_dict:
+                    with self.assertRaises(ValueError) as ctx:
+                        self.storage.parse_backup(json.dumps(raw))
+                from_dict.assert_not_called()
+                self.assertIn(message, str(ctx.exception))
+
+    def test_record_counts_at_the_limits_are_accepted(self):
+        people = [{"id": "p%d" % i, "name": "P%d" % i}
+                  for i in range(MAX_PEOPLE)]
+        per_item = MAX_PARTICIPANT_REFS // MAX_ITEMS
+        pids = ["p%d" % i for i in range(per_item)]
+        items = [{"id": "i%d" % i, "description": "x", "amount_cents": 100,
+                  "payer_id": "p0", "participant_ids": pids,
+                  "split": {"mode": "equal"}} for i in range(MAX_ITEMS)]
+
+        state, issues = self.storage.parse_backup(
+            json.dumps({"people": people, "items": items}))
+
+        self.assertEqual(len(state.people), MAX_PEOPLE)
+        self.assertEqual(len(state.items), MAX_ITEMS)
+        self.assertEqual(issues, [])
+
+    def test_participant_entries_are_limited_across_items(self):
+        pids = ["p%d" % i for i in range(MAX_PARTICIPANT_REFS // 10 + 1)]
+        items = [{"id": "i%d" % i, "participant_ids": pids} for i in range(10)]
+
+        with mock.patch.object(self.storage.AppState, "from_dict") as from_dict:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(
+                    json.dumps({"people": [], "items": items}))
+
+        from_dict.assert_not_called()
+        self.assertIn("at most %d participant entries" % MAX_PARTICIPANT_REFS,
+                      str(ctx.exception))
+
     def test_negative_size_counts_as_too_large(self):
         # MicroPython's jsffi truncates JS numbers to int32, so a multi-GiB
         # File.size can arrive negative.
@@ -230,12 +321,16 @@ class FakeElement:
 
 
 class FakeDocument:
-    def __init__(self, extra_elements=None):
+    def __init__(self, extra_elements=None, extra_lists=None):
         self.body = FakeElement("body")
         self._extra = extra_elements or {}
+        self._lists = extra_lists or {}
 
     def querySelector(self, selector):
         return self._extra.get(selector)
+
+    def querySelectorAll(self, selector):
+        return FakeFileList(self._lists.get(selector, []))
 
     def createElement(self, tag):
         return FakeElement(tag)
@@ -293,11 +388,11 @@ class FakeFileInput:
         self.value = "sentinel.json"
 
 
-def load_ui(pill, extra_elements=None):
+def load_ui(pill, extra_elements=None, extra_lists=None):
     elements = dict(extra_elements or {})
     elements[".saved-pill"] = pill
     pyscript = types.ModuleType("pyscript")
-    pyscript.document = FakeDocument(elements)
+    pyscript.document = FakeDocument(elements, extra_lists)
     pyscript.window = types.SimpleNamespace(
         console=FakeConsole(), encodeURIComponent=lambda s: s)
     ffi = types.ModuleType("pyscript.ffi")
@@ -561,6 +656,102 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(len(created), created_by_first)
         self.assertEqual(first.promises[0].callbacks,
                          second.promises[0].callbacks)
+
+
+class BillLimitTests(unittest.TestCase):
+    """The UI stops at the same limits import enforces, so every bill the
+    app can build can also be restored from its own backup."""
+
+    def setUp(self):
+        self.people_error = FakeElement()
+        self.item_error = FakeElement()
+        self.name_field = FakeElement()
+        self.desc = FakeElement()
+        self.amount = FakeElement()
+        self.payer = FakeElement()
+        self.uneven = types.SimpleNamespace(checked=False)
+        self.checks = []
+        self.ui = load_ui(FakePill(), {
+            "#people-error": self.people_error,
+            "#item-error": self.item_error,
+            "#person-name": self.name_field,
+            "#item-desc": self.desc,
+            "#item-amount": self.amount,
+            "#payer-select": self.payer,
+            "#mode-uneven": self.uneven,
+        }, {".p-check": self.checks})
+        self.ui._storage = load_storage(FakeLocalStorage())
+
+    def people(self, n):
+        return [Person("p%d" % i, "P%d" % i) for i in range(n)]
+
+    def fill_item_form(self, participant_ids):
+        self.desc.value = "Lunch"
+        self.amount.value = "12.00"
+        self.payer.value = participant_ids[0]
+        self.checks[:] = [types.SimpleNamespace(checked=True, value=pid)
+                          for pid in participant_ids]
+
+    def test_adding_a_person_stops_at_the_people_limit(self):
+        self.ui._state = AppState(people=self.people(MAX_PEOPLE - 1))
+        self.name_field.value = "Last one"
+        self.ui.on_add_person(None)
+        self.assertEqual(len(self.ui._state.people), MAX_PEOPLE)
+
+        self.name_field.value = "One too many"
+        self.ui.on_add_person(None)
+
+        self.assertEqual(len(self.ui._state.people), MAX_PEOPLE)
+        self.assertEqual(self.people_error.textContent,
+                         "A bill can have at most %d people." % MAX_PEOPLE)
+
+    def test_adding_an_item_stops_at_the_item_limit(self):
+        people = self.people(1)
+        items = [Item("i%d" % i, "x", 100, "p0", ["p0"], {"mode": "equal"})
+                 for i in range(MAX_ITEMS)]
+        self.ui._state = AppState(people=people, items=items)
+        self.fill_item_form(["p0"])
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(len(self.ui._state.items), MAX_ITEMS)
+        self.assertEqual(self.item_error.textContent,
+                         "A bill can have at most %d items." % MAX_ITEMS)
+
+    def test_adding_an_item_stops_at_the_participant_entry_limit(self):
+        per_item = MAX_PARTICIPANT_REFS // (MAX_ITEMS - 1) + 1
+        people = self.people(per_item)
+        pids = [p.id for p in people]
+        # Fill up to exactly the limit with fewer than MAX_ITEMS items.
+        items, refs = [], 0
+        while refs + per_item <= MAX_PARTICIPANT_REFS:
+            items.append(Item("i%d" % len(items), "x", 100, "p0", pids,
+                              {"mode": "equal"}))
+            refs += per_item
+        tail = MAX_PARTICIPANT_REFS - refs
+        if tail:
+            items.append(Item("i%d" % len(items), "x", 100, "p0", pids[:tail],
+                              {"mode": "equal"}))
+        self.assertLess(len(items), MAX_ITEMS)
+        self.ui._state = AppState(people=people, items=items)
+        self.fill_item_form(["p0"])
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(len(self.ui._state.items), len(items))
+        self.assertEqual(
+            self.item_error.textContent,
+            "A bill can have at most %d participant entries across all items."
+            % MAX_PARTICIPANT_REFS)
+
+    def test_adding_an_item_below_the_limits_still_works(self):
+        self.ui._state = AppState(people=self.people(2))
+        self.fill_item_form(["p0", "p1"])
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(len(self.ui._state.items), 1)
+        self.assertEqual(self.item_error.textContent, "")
 
 
 if __name__ == "__main__":

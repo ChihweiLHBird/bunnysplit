@@ -22,7 +22,8 @@ from splitcore.calc import (
     settle_up,
 )
 from splitcore.model import (
-    MAX_CENTS, AppState, MODE_EQUAL, MODE_UNEVEN, Item, Person)
+    MAX_CENTS, MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState,
+    MODE_EQUAL, MODE_UNEVEN, Item, Person)
 
 _state: AppState = None  # type: ignore  # bound in start()
 _storage = None
@@ -518,6 +519,10 @@ def on_add_person(event):
     field = _qs("#person-name")
     name = field.value.strip()
     err = _qs("#people-error")
+    # Same limits as backup import, so every bill can be restored.
+    if len(_state.people) >= MAX_PEOPLE:
+        err.textContent = "A bill can have at most %d people." % MAX_PEOPLE
+        return
     if not name:
         err.textContent = "Enter a name."
         return
@@ -572,6 +577,10 @@ def _select_share_field(event):
 def on_add_item(event):
     err = _qs("#item-error")
     err.textContent = ""
+    # Same limits as backup import, so every bill can be restored.
+    if len(_state.items) >= MAX_ITEMS:
+        err.textContent = "A bill can have at most %d items." % MAX_ITEMS
+        return
 
     desc = _qs("#item-desc").value.strip()
     if not desc:
@@ -598,6 +607,12 @@ def on_add_item(event):
     participant_ids = [c.value for c in checked]
     if not participant_ids:
         err.textContent = "Pick at least one participant."
+        return
+    refs = sum(len(i.participant_ids) for i in _state.items)
+    if refs + len(participant_ids) > MAX_PARTICIPANT_REFS:
+        err.textContent = (
+            "A bill can have at most %d participant entries across all items."
+            % MAX_PARTICIPANT_REFS)
         return
 
     uneven = _qs("#mode-uneven").checked

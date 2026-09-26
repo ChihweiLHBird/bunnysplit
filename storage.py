@@ -1,10 +1,12 @@
 """localStorage persistence. Browser-only (imports pyscript)."""
 
 import json
+import re
 
 from pyscript import window
 
-from splitcore.model import AppState
+from splitcore.model import (
+    MAX_ID_LENGTH, MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState)
 
 KEY = "bunnysplit"
 CORRUPT_KEY = KEY + ":corrupt"
@@ -107,9 +109,15 @@ def dumps(state):
     return json.dumps(state.to_dict())
 
 
-# About the localStorage quota, so real backups fit comfortably while an
-# accidentally chosen huge file is refused without being read.
-MAX_BACKUP_BYTES = 5 * 1024 * 1024
+# MicroPython 1.24 parses one long JSON string in quadratic time (1 MiB took
+# ~1.25 s, 5 MiB ~34 s), so stay far below the localStorage quota. A bill at
+# the model's MAX_* limits (weighted splits, short ids) exports to ~400 KiB.
+MAX_BACKUP_BYTES = 1024 * 1024
+
+# Integer ids may be up to MAX_ID_LENGTH digits; nothing legitimate is longer.
+MAX_NUMBER_DIGITS = MAX_ID_LENGTH
+# Spelled out on purpose: MicroPython's re accepts "{n}" but never matches it.
+_LONG_NUMBER = re.compile("[0-9]" * (MAX_NUMBER_DIGITS + 1))
 
 
 def check_backup_size(size):
@@ -117,6 +125,34 @@ def check_backup_size(size):
     # truncates JS numbers to int32.
     if size < 0 or size > MAX_BACKUP_BYTES:
         raise ValueError("That file is too large to be a bunnysplit backup.")
+
+
+def _has_long_number(text):
+    # MicroPython converts a huge integer literal in quadratic time (150k
+    # digits took 1.5 s), so long digit runs must be refused before json.loads.
+    # Only digits outside strings become numbers. Dropping escaped backslashes,
+    # then escaped quotes, leaves every remaining '"' as a string delimiter, so
+    # the even-indexed pieces of a split lie outside strings. These are C-level
+    # string ops; a per-character Python loop is ~20x slower here.
+    bare = text.replace("\\\\", "").replace('\\"', "")
+    return _LONG_NUMBER.search(" ".join(bare.split('"')[::2])) is not None
+
+
+def _check_backup_counts(raw):
+    # Count the raw lists before building anything. This is conservative on
+    # purpose: from_dict() may still drop duplicate or malformed records.
+    if len(raw["people"]) > MAX_PEOPLE:
+        raise ValueError("A backup can have at most %d people." % MAX_PEOPLE)
+    if len(raw["items"]) > MAX_ITEMS:
+        raise ValueError("A backup can have at most %d items." % MAX_ITEMS)
+    refs = 0
+    for item in raw["items"]:
+        if isinstance(item, dict) and isinstance(item.get("participant_ids"), list):
+            refs += len(item["participant_ids"])
+    if refs > MAX_PARTICIPANT_REFS:
+        raise ValueError(
+            "A backup can have at most %d participant entries across all "
+            "items." % MAX_PARTICIPANT_REFS)
 
 
 def parse_backup(text):
@@ -128,6 +164,9 @@ def parse_backup(text):
     would silently import as an empty bill.
     """
     check_backup_size(len(text))
+    if _has_long_number(text):
+        raise ValueError(
+            "That file has a number too long to be a bunnysplit backup.")
     try:
         raw = json.loads(text)
     except Exception:
@@ -138,6 +177,7 @@ def parse_backup(text):
         raise ValueError(
             "That file isn't a bunnysplit backup "
             "(expected \"people\" and \"items\" lists).")
+    _check_backup_counts(raw)
     issues = []
     state = AppState.from_dict(
         raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
