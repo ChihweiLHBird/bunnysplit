@@ -80,6 +80,7 @@ bash -n scripts/stage-assets.sh
   - “Settle up” transfer list (greedy, minimal transfers)
 - Delete items; removing people is blocked if they are referenced by existing items
 - State is saved automatically and survives reloads (and private browsing gracefully degrades)
+- Back up the whole bill as a JSON file and restore it later or on another device; importing over an existing bill asks before replacing it
 - Responsive layout that works on phones and desktops
 
 ---
@@ -123,7 +124,7 @@ Browser
 ├── pyscript.toml        # MicroPython import allowlist
 ├── main.py              # Entry point
 ├── ui.py                # Rendering + event handlers
-├── storage.py           # localStorage persistence
+├── storage.py           # localStorage persistence + backup file format
 ├── splitcore/
 │   ├── __init__.py
 │   ├── model.py         # Data model + (de)serialization

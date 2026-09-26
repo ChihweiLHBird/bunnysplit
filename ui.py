@@ -11,8 +11,6 @@ Workspace design notes:
   stable across renders without storing them in the model.
 """
 
-import json
-
 from pyscript import document, window
 from pyscript.ffi import create_proxy
 
@@ -637,93 +635,120 @@ def _make_remove_item(iid):
     return handler
 
 
-# ---------- import / export ----------
+# ---------- backup: export / import ----------
+
+# Proxies for the file-read promise: created on the first import, then
+# reused. The promise settles after on_import_file_change returns, so they
+# can't be render-scoped, and destroying a per-import pair from inside its
+# own callback would free the proxy that is still executing (see render_all).
+_import_callbacks = None
+
+
+def _count(n, singular, plural):
+    return "%d %s" % (n, singular if n == 1 else plural)
+
+
+def _bill_summary(state):
+    return "%s, %s" % (_count(len(state.people), "person", "people"),
+                       _count(len(state.items), "item", "items"))
+
+
+def _issues_note(issues):
+    n = len(issues)
+    return ("1 record was" if n == 1 else "%d records were" % n) + (
+        " skipped or adjusted")
+
+
+def _set_backup_status(text, error=False):
+    node = _qs("#backup-status")
+    node.textContent = text
+    node.className = "error" if error else "status"
+
 
 def on_export_state(event):
-    # No indent kwarg: MicroPython's json.dumps doesn't accept it, and this
-    # module runs as MicroPython in the browser (see index.html's <script
-    # type="mpy">), not CPython.
-    data = json.dumps(_state.to_dict())
-    href = "data:application/json;charset=utf-8," + window.encodeURIComponent(data)
+    # Same serialization as localStorage, so a backup restores exactly what
+    # was saved.
+    href = ("data:application/json;charset=utf-8,"
+            + window.encodeURIComponent(_storage.dumps(_state)))
     link = _el("a")
     link.href = href
     link.download = "bunnysplit-export.json"
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+    _set_backup_status("")
 
 
 def on_import_click(event):
     _qs("#import-file").click()
 
 
-def _apply_imported_json(text):
-    err = _qs("#data-error")
+def _import_backup(text):
+    global _state
     try:
-        raw = json.loads(text)
-    except Exception:
-        err.textContent = "That file isn't valid JSON."
+        new_state, issues = _storage.parse_backup(text)
+    except ValueError as e:
+        _set_backup_status(str(e), error=True)
         return
-    # AppState.from_dict() treats a non-object top level as "no data" and
-    # returns an empty state — applying that would silently wipe the
-    # existing bill. Reject it here instead of overwriting current data.
-    if not isinstance(raw, dict):
-        err.textContent = "Import failed: top-level value must be a JSON object."
-        return
-    issues = []
-    new_state = AppState.from_dict(
-        raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
-    _state.people = new_state.people
-    _state.items = new_state.items
+    if _state.people or _state.items:
+        question = (
+            "Replace the current bill (%s) with the imported one (%s)? "
+            "This can't be undone; export first to keep a copy."
+            % (_bill_summary(_state), _bill_summary(new_state)))
+        if issues:
+            question += "\n\n%s while reading the file." % _issues_note(issues)
+        if not window.confirm(question):
+            _set_backup_status("Import cancelled; your current bill was kept.")
+            return
+    _state = new_state
     _seed_counter()
-    if issues:
-        err.textContent = (
-            "Imported with %d issue(s) — some records were skipped or "
-            "adjusted; see console for details." % len(issues))
-    else:
-        err.textContent = "Imported successfully."
     _persist_and_render()
+    message = "Imported %s and %s." % (
+        _count(len(_state.people), "person", "people"),
+        _count(len(_state.items), "item", "items"))
+    if issues:
+        message += " %s; see the browser console for details." % (
+            _issues_note(issues))
+    _set_backup_status(message)
+
+
+def _on_import_text(text):
+    # Promise callback: an escaped exception would only reach the console
+    # and leave the user without feedback.
+    try:
+        _import_backup(text)
+    except Exception as e:
+        window.console.warn("bunnysplit: import failed: " + str(e))
+        _set_backup_status("Import failed: " + str(e), error=True)
+
+
+def _on_import_read_error(err):
+    window.console.warn("bunnysplit: could not read import: " + str(err))
+    _set_backup_status("Could not read the selected file.", error=True)
 
 
 def on_import_file_change(event):
-    err = _qs("#data-error")
-    err.textContent = ""
+    global _import_callbacks
+    _set_backup_status("")
     field = event.target
     files = field.files
     if not files or files.length == 0:
         return
     file = files.item(0)
-
-    proxies = []
-
-    def _cleanup():
-        for p in proxies:
-            try:
-                p.destroy()
-            except Exception:
-                pass
-
-    def _ok(text):
-        try:
-            _apply_imported_json(text)
-        finally:
-            _cleanup()
-
-    def _fail(e):
-        try:
-            window.console.warn("bunnysplit: import read failed: " + str(e))
-            err.textContent = "Could not read the selected file."
-        finally:
-            _cleanup()
-
-    proxies.append(create_proxy(_ok))
-    proxies.append(create_proxy(_fail))
     try:
-        file.text().then(*proxies)
+        _storage.check_backup_size(file.size)
+        if _import_callbacks is None:
+            _import_callbacks = (create_proxy(_on_import_text),
+                                 create_proxy(_on_import_read_error))
+        # file.size can wrap to a small value for files over 4 GiB (int32
+        # truncation), so also cap the read itself; parse_backup() rejects
+        # anything that reaches the cap.
+        limit = _storage.MAX_BACKUP_BYTES + 1
+        file.slice(0, limit).text().then(*_import_callbacks)
+    except ValueError as e:
+        _set_backup_status(str(e), error=True)
     except Exception as e:
-        window.console.warn("bunnysplit: import failed: " + str(e))
-        err.textContent = "Could not read the selected file."
-        _cleanup()
+        _on_import_read_error(e)
     finally:
         # Reset so choosing the same file again still fires "change".
         field.value = ""

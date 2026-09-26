@@ -99,8 +99,53 @@ def load():
         return AppState()
 
 
+def dumps(state):
+    """Serialize state for localStorage and exported backups alike.
+
+    Compact on purpose: MicroPython's json.dumps has no indent kwarg.
+    """
+    return json.dumps(state.to_dict())
+
+
+# About the localStorage quota, so real backups fit comfortably while an
+# accidentally chosen huge file is refused without being read.
+MAX_BACKUP_BYTES = 5 * 1024 * 1024
+
+
+def check_backup_size(size):
+    # Negative means a multi-GiB File.size wrapped: MicroPython's jsffi
+    # truncates JS numbers to int32.
+    if size < 0 or size > MAX_BACKUP_BYTES:
+        raise ValueError("That file is too large to be a bunnysplit backup.")
+
+
+def parse_backup(text):
+    """Parse an exported backup into (AppState, issues).
+
+    Raises ValueError with a user-facing message for anything that is not a
+    backup. AppState.from_dict() reads a missing people/items key as an empty
+    list, so shape is checked here first; otherwise an unrelated JSON object
+    would silently import as an empty bill.
+    """
+    check_backup_size(len(text))
+    try:
+        raw = json.loads(text)
+    except Exception:
+        raise ValueError("That file isn't valid JSON.")
+    if (not isinstance(raw, dict)
+            or not isinstance(raw.get("people"), list)
+            or not isinstance(raw.get("items"), list)):
+        raise ValueError(
+            "That file isn't a bunnysplit backup "
+            "(expected \"people\" and \"items\" lists).")
+    issues = []
+    state = AppState.from_dict(
+        raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
+    return state, issues
+
+
 def save(state):
-    window.localStorage.setItem(KEY, json.dumps(state.to_dict()))
+    window.localStorage.setItem(KEY, dumps(state))
 
 
 def writable():

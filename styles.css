@@ -893,6 +893,13 @@ body:has(#mode-uneven:checked) .chip:has(.p-check:checked) .p-weight {
   min-height: 1.1em;
   margin-top: 6px;
 }
+/* Neutral outcome line (e.g. #backup-status); ui.py swaps in .error. */
+.status {
+  color: var(--ink-3);
+  font-size: 12px;
+  min-height: 1.1em;
+  margin-top: 6px;
+}
 
 /* ================ MOBILE TWEAKS ================ */
 @media (max-width: 760px) {
