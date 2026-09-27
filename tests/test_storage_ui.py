@@ -581,6 +581,29 @@ class ImportExportTests(unittest.TestCase):
         self.assertIsNone(self.saved())
         self.assertEqual(self.status.className, "error")
 
+    def test_import_with_an_overflowing_weight_still_saves_loadable_json(self):
+        # 1e309 parses to inf; saving it verbatim would write a bare
+        # inf/Infinity that the next load cannot parse, emptying the bill.
+        text = (
+            '{"people": [{"id": "p1", "name": "A"}, {"id": "p2", "name": "B"}],'
+            ' "items": [{"id": "i1", "description": "x", "amount_cents": 500,'
+            ' "payer_id": "p1", "participant_ids": ["p1", "p2"], "split":'
+            ' {"mode": "uneven", "weights": {"p1": 1e309, "p2": 1},'
+            ' "junk": [1e309]}}]}')
+
+        self.import_text(text)
+
+        def reject(constant):
+            raise ValueError("non-standard JSON constant " + constant)
+
+        raw = self.local.values["bunnysplit"]
+        json.loads(raw, parse_constant=reject)
+        self.assertIn("skipped or adjusted", self.status.textContent)
+        reloaded = load_storage(FakeLocalStorage({"bunnysplit": raw}))
+        state = reloaded.load()
+        self.assertEqual(len(state.items), 1)
+        self.assertEqual(reloaded.recovery_warning(), "")
+
     def test_import_into_an_empty_bill_applies_without_asking(self):
         field = self.import_text(BACKUP)
 

@@ -46,6 +46,17 @@ def _report_issue(on_issue, kind, exc):
             pass
 
 
+def _json_safe_scalar(value):
+    # What json.dumps writes back as standard JSON. A float from an
+    # overflowing literal (1e309) is inf, which dumps emits as a bare
+    # inf/Infinity that json.loads rejects. MicroPython lacks
+    # math.isfinite, so test NaN by self-inequality and inf by abs().
+    if value is None or isinstance(value, (bool, int, str)):
+        return True
+    return isinstance(value, float) and value == value and (
+        abs(value) != float("inf"))
+
+
 def _normalize_id(value, kind):
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ValueError(kind + " id must be a string or integer")
@@ -145,6 +156,26 @@ class Item:
         if split.get("mode") not in (MODE_EQUAL, MODE_UNEVEN):
             _report_issue(on_issue, "item", "unknown split mode")
             split = {"mode": MODE_EQUAL}
+        # Keep only what split_item() reads, as values that survive a save
+        # and reload: one non-finite number would make the saved JSON
+        # unparseable and lose the whole bill. split_item() already treats
+        # every dropped weight as 0, so the computed split is unchanged.
+        clean = {"mode": split["mode"]}
+        if split["mode"] == MODE_UNEVEN and "weights" in split:
+            weights = split["weights"]
+            if not isinstance(weights, dict):
+                _report_issue(on_issue, "item", "weights is not an object")
+                weights = {}
+            clean["weights"] = {}
+            for pid, weight in weights.items():
+                if _json_safe_scalar(weight):
+                    clean["weights"][pid] = weight
+                else:
+                    _report_issue(on_issue, "item",
+                                  "dropped invalid weight for '%s'" % pid)
+        if len(clean) != len(split):
+            _report_issue(on_issue, "item", "dropped unknown split fields")
+        split = clean
 
         amount = d.get("amount_cents", 0)
         # bool is an int subclass; exclude it. Reject non-int (e.g. strings

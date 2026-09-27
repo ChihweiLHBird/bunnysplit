@@ -11,4 +11,5 @@
 - Bound digit counts before `parse_cents()` calls `int()`; a later `MAX_CENTS` comparison does not prevent oversized conversion failures.
 - After edits here, run `python -m unittest discover -s tests` and `python -m py_compile splitcore/*.py`.
 - Persisted-state hardening caps amounts (`MAX_CENTS` in `model.py`) and uneven weights (`_MAX_WEIGHT` in `calc.py`); preserve those bounds and exact penny conservation when changing split math or deserialization.
+- `Item.from_dict()` keeps only `mode` (and `weights` for uneven splits) in `split`, and only JSON-safe weight values; non-finite numbers and containers are dropped with an issue. `1e309` parses to `inf`, and `json.dumps` writes it back as a bare `inf`/`Infinity` that the next `json.loads` rejects, losing the whole bill. `split_item()` already treats dropped weights as 0, so the split is unchanged.
 - If repository behavior contradicts this file, patch `splitcore/AGENTS.md` in the same change and preserve the `splitcore/CLAUDE.md` symlink.

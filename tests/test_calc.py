@@ -529,5 +529,77 @@ class HugeWeightTests(unittest.TestCase):
         self.assertEqual(sum(shares.values()), 1000)
 
 
+class SplitSanitizingTests(unittest.TestCase):
+    """Item.from_dict keeps only split data that survives a JSON round trip.
+
+    json.loads turns 1e309 into inf, and dumps() writes that back as a bare
+    inf/Infinity that json.loads rejects, so the next load would drop the
+    whole bill. split_item() already treats each dropped value as weight 0,
+    so the computed split does not change."""
+
+    def _state(self, split):
+        issues = []
+        state = AppState.from_dict(
+            {"people": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}],
+             "items": [{"id": "i", "description": "x", "amount_cents": 1000,
+                        "payer_id": "a", "participant_ids": ["a", "b"],
+                        "split": split}]},
+            on_issue=lambda kind, message: issues.append((kind, message)))
+        return state, issues
+
+    def assert_strict_json(self, state):
+        json.dumps(state.to_dict(), allow_nan=False)
+
+    def test_overflowing_weight_is_dropped_and_split_is_unchanged(self):
+        split = json.loads('{"mode": "uneven", "weights": {"a": 1e309, "b": 2}}')
+        before = split_item(item(1000, ["a", "b"], split=dict(split)))
+
+        state, issues = self._state(split)
+
+        self.assertEqual(state.items[0].split,
+                         {"mode": MODE_UNEVEN, "weights": {"b": 2}})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(len(issues), 1)
+        self.assert_strict_json(state)
+
+    def test_nan_and_negative_infinity_weights_are_dropped(self):
+        state, issues = self._state(uneven({"a": float("nan"),
+                                            "b": float("-inf")}))
+
+        self.assertEqual(state.items[0].weights(), {})
+        self.assertEqual(len(issues), 2)
+        self.assert_strict_json(state)
+
+    def test_container_weights_are_dropped(self):
+        # A container could hide a non-finite number anywhere inside it.
+        state, issues = self._state(uneven({"a": [1e309], "b": {"x": 1}}))
+
+        self.assertEqual(state.items[0].weights(), {})
+        self.assertEqual(len(issues), 2)
+        self.assert_strict_json(state)
+
+    def test_json_safe_weights_are_kept_as_is(self):
+        weights = {"a": 1, "b": "2", "c": 0.5, "d": True, "e": None}
+
+        state, issues = self._state(uneven(dict(weights)))
+
+        self.assertEqual(state.items[0].weights(), weights)
+        self.assertEqual(issues, [])
+
+    def test_unknown_split_fields_are_dropped(self):
+        for split, expected in (
+            ({"mode": "equal", "junk": [float("inf")], "weights": {"a": 1}},
+             {"mode": MODE_EQUAL}),
+            ({"mode": "uneven", "weights": {"a": 1}, "extra": float("inf")},
+             {"mode": MODE_UNEVEN, "weights": {"a": 1}}),
+        ):
+            with self.subTest(split=split):
+                state, issues = self._state(split)
+
+                self.assertEqual(state.items[0].split, expected)
+                self.assertEqual(len(issues), 1)
+                self.assert_strict_json(state)
+
+
 if __name__ == "__main__":
     unittest.main()
