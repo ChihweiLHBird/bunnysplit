@@ -6,7 +6,8 @@ import re
 from pyscript import window
 
 from splitcore.model import (
-    MAX_ID_LENGTH, MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState)
+    MAX_DESCRIPTION_LENGTH, MAX_ID_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH,
+    MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState)
 
 KEY = "bunnysplit"
 CORRUPT_KEY = KEY + ":corrupt"
@@ -109,10 +110,12 @@ def dumps(state):
     return json.dumps(state.to_dict())
 
 
-# MicroPython 1.24 parses one long JSON string in quadratic time (1 MiB took
-# ~1.25 s, 5 MiB ~34 s), so stay far below the localStorage quota. A bill at
-# the model's MAX_* limits (weighted splits, short ids) exports to ~400 KiB.
-MAX_BACKUP_BYTES = 1024 * 1024
+# Both directions are quadratic in size under MicroPython 1.24: json.loads of
+# one long string (1 MiB took ~1.25 s) and json.dumps of the whole bill (298
+# KiB ~130 ms, 650 KiB ~600 ms, 1.28 MiB ~3 s), and save() runs dumps on every
+# edit. 512 KiB keeps both well under a second. The add handlers and import
+# both check the exact export size, so every saved bill fits in a backup.
+MAX_BACKUP_BYTES = 512 * 1024
 
 # Integer ids may be up to MAX_ID_LENGTH digits; nothing legitimate is longer.
 MAX_NUMBER_DIGITS = MAX_ID_LENGTH
@@ -125,6 +128,37 @@ def check_backup_size(size):
     # truncates JS numbers to int32.
     if size < 0 or size > MAX_BACKUP_BYTES:
         raise ValueError("That file is too large to be a bunnysplit backup.")
+
+
+def check_export_size(text):
+    # UTF-8 bytes, the unit of the exported file and of MAX_BACKUP_BYTES.
+    if len(text.encode()) > MAX_BACKUP_BYTES:
+        raise ValueError("This bill is too large to back up (limit %d KiB)."
+                         % (MAX_BACKUP_BYTES // 1024))
+
+
+def check_restorable(state):
+    """Return the export text, or raise ValueError saying why
+    parse_backup() would refuse it."""
+    if len(state.people) > MAX_PEOPLE:
+        raise ValueError("A bill can have at most %d people." % MAX_PEOPLE)
+    if len(state.items) > MAX_ITEMS:
+        raise ValueError("A bill can have at most %d items." % MAX_ITEMS)
+    if sum(len(i.participant_ids) for i in state.items) > MAX_PARTICIPANT_REFS:
+        raise ValueError(
+            "A bill can have at most %d participant entries across all items."
+            % MAX_PARTICIPANT_REFS)
+    for person in state.people:
+        if len(person.name) > MAX_NAME_LENGTH:
+            raise ValueError(
+                "Names can be at most %d characters." % MAX_NAME_LENGTH)
+    for item in state.items:
+        if len(item.description) > MAX_DESCRIPTION_LENGTH:
+            raise ValueError("Descriptions can be at most %d characters."
+                             % MAX_DESCRIPTION_LENGTH)
+    text = dumps(state)
+    check_export_size(text)
+    return text
 
 
 def _has_long_number(text):
@@ -181,11 +215,15 @@ def parse_backup(text):
     issues = []
     state = AppState.from_dict(
         raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
+    # Text lengths and the re-export size can only be judged after from_dict()
+    # (it str()s non-string names, and quotes integer ids).
+    check_restorable(state)
     return state, issues
 
 
-def save(state):
-    window.localStorage.setItem(KEY, dumps(state))
+def save(state, text=None):
+    # text: dumps(state) when the caller already has it (dumps is costly).
+    window.localStorage.setItem(KEY, dumps(state) if text is None else text)
 
 
 def writable():

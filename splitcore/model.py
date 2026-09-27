@@ -21,6 +21,10 @@ MAX_ID_LENGTH = 64
 MAX_PEOPLE = 200
 MAX_ITEMS = 1000
 MAX_PARTICIPANT_REFS = 20000
+# Names repeat in every item row they appear in ("Among ...", payer), so an
+# uncapped name multiplies rendered text by the item count.
+MAX_NAME_LENGTH = 60
+MAX_DESCRIPTION_LENGTH = 120
 
 
 def _warn_skip(kind, exc):

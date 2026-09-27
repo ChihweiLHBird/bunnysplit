@@ -86,7 +86,7 @@
         <div class="panel-body">
           <ul id="people-list" class="people-list"></ul>
           <div class="row-add-person">
-            <input id="person-name" class="input" type="text" aria-label="Person name" placeholder="Add a name…" autocomplete="off">
+            <input id="person-name" class="input" type="text" aria-label="Person name" placeholder="Add a name…" maxlength="60" autocomplete="off">
             <button id="add-person" class="btn btn-secondary">+ Add person</button>
           </div>
           <p id="people-error" class="error" role="alert"></p>
@@ -162,7 +162,7 @@
           <div class="quick-form">
             <div class="field field-full">
               <label class="field-label" for="item-desc">Description</label>
-              <input id="item-desc" class="input" type="text" placeholder="What was it?" autocomplete="off">
+              <input id="item-desc" class="input" type="text" placeholder="What was it?" maxlength="120" autocomplete="off">
             </div>
             <div class="field">
               <label class="field-label" for="item-amount">Amount</label>

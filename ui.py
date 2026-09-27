@@ -22,8 +22,9 @@ from splitcore.calc import (
     settle_up,
 )
 from splitcore.model import (
-    MAX_CENTS, MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState,
-    MODE_EQUAL, MODE_UNEVEN, Item, Person)
+    MAX_CENTS, MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH,
+    MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState, MODE_EQUAL, MODE_UNEVEN, Item,
+    Person)
 
 _state: AppState = None  # type: ignore  # bound in start()
 _storage = None
@@ -499,13 +500,14 @@ def _set_save_status(ok, detail=""):
         pill.title = msg
 
 
-def _persist_and_render():
+def _persist_and_render(text=None):
     """Save then re-render. A storage failure (quota, private mode) must
     not desync memory from the DOM or surface a traceback. We log,
     flip the pill to show the failure, and still render so the user
-    can keep working in-memory."""
+    can keep working in-memory. text: the state's dumps() if the caller
+    already serialized it."""
     try:
-        _storage.save(_state)
+        _storage.save(_state, text)
         _set_save_status(True)
     except Exception as e:
         window.console.warn("bunnysplit: could not save: " + str(e))
@@ -514,6 +516,21 @@ def _persist_and_render():
 
 
 # ---------- handlers ----------
+
+def _fits_backup_or_undo(records, err):
+    """Return the state's export text, or undo the record just appended to
+    `records` if the bill would no longer fit in a restorable backup. Only
+    the export size is checked here, so a bill saved before the text caps
+    existed can still grow; the text is reused for the save."""
+    text = _storage.dumps(_state)
+    try:
+        _storage.check_export_size(text)
+    except ValueError as e:
+        records.pop()
+        err.textContent = str(e)
+        return None
+    return text
+
 
 def on_add_person(event):
     field = _qs("#person-name")
@@ -529,9 +546,15 @@ def on_add_person(event):
     if any(p.name == name for p in _state.people):
         err.textContent = "That name already exists."
         return
+    if len(name) > MAX_NAME_LENGTH:
+        err.textContent = "Names can be at most %d characters." % MAX_NAME_LENGTH
+        return
     _state.people.append(Person(_next_id("p"), name))
+    text = _fits_backup_or_undo(_state.people, err)
+    if text is None:
+        return
     field.value = ""
-    _persist_and_render()
+    _persist_and_render(text)
 
 
 def _make_remove_person(pid):
@@ -586,6 +609,10 @@ def on_add_item(event):
     if not desc:
         err.textContent = "Enter a description."
         return
+    if len(desc) > MAX_DESCRIPTION_LENGTH:
+        err.textContent = ("Descriptions can be at most %d characters."
+                           % MAX_DESCRIPTION_LENGTH)
+        return
 
     amount_cents = parse_cents(_qs("#item-amount").value)
     if amount_cents is None:
@@ -638,9 +665,12 @@ def on_add_item(event):
 
     _state.items.append(Item(
         _next_id("i"), desc, amount_cents, payer_id, participant_ids, split))
+    text = _fits_backup_or_undo(_state.items, err)
+    if text is None:
+        return
     _qs("#item-desc").value = ""
     _qs("#item-amount").value = ""
-    _persist_and_render()
+    _persist_and_render(text)
 
 
 def _make_remove_item(iid):
@@ -682,16 +712,28 @@ def _set_backup_status(text, error=False):
 
 def on_export_state(event):
     # Same serialization as localStorage, so a backup restores exactly what
-    # was saved.
+    # was saved. Always export, but flag a bill (e.g. saved before the
+    # limits existed) that this app's import would refuse.
+    try:
+        text = _storage.check_restorable(_state)
+        problem = None
+    except ValueError as e:
+        text = _storage.dumps(_state)
+        problem = str(e)
     href = ("data:application/json;charset=utf-8,"
-            + window.encodeURIComponent(_storage.dumps(_state)))
+            + window.encodeURIComponent(text))
     link = _el("a")
     link.href = href
     link.download = "bunnysplit-export.json"
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
-    _set_backup_status("")
+    if problem:
+        _set_backup_status(
+            "Exported, but this app can't restore that file: " + problem,
+            error=True)
+    else:
+        _set_backup_status("")
 
 
 def on_import_click(event):
@@ -807,6 +849,8 @@ def start(state, storage_module):
     _storage = storage_module
     _seed_counter()
     _qs("#item-amount").maxLength = MAX_AMOUNT_INPUT_LENGTH
+    _qs("#person-name").maxLength = MAX_NAME_LENGTH
+    _qs("#item-desc").maxLength = MAX_DESCRIPTION_LENGTH
     _on(_qs("#add-person"), "click", on_add_person, track=False)
     _on(_qs("#add-item"), "click", on_add_item, track=False)
     _on(_qs("#export-state"), "click", on_export_state, track=False)

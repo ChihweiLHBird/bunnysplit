@@ -9,7 +9,8 @@ import unittest
 from unittest import mock
 
 from splitcore.model import (
-    MAX_ITEMS, MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState, Item, Person)
+    MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH, MAX_PARTICIPANT_REFS,
+    MAX_PEOPLE, AppState, Item, Person)
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -186,14 +187,17 @@ class BackupFormatTests(unittest.TestCase):
             self.storage.parse_backup(too_long)
 
     def test_long_digit_runs_inside_strings_are_allowed(self):
+        description = 'say "hi" ' + "1" * 100
         text = json.dumps({
-            "people": [{"id": "p1", "name": 'say "hi" ' + "1" * 100}],
-            "items": [],
+            "people": [{"id": "p1", "name": "A"}],
+            "items": [{"id": "i1", "description": description,
+                       "amount_cents": 100, "payer_id": "p1",
+                       "participant_ids": ["p1"], "split": {"mode": "equal"}}],
         })
 
         state, issues = self.storage.parse_backup(text)
 
-        self.assertEqual(state.people[0].name, 'say "hi" ' + "1" * 100)
+        self.assertEqual(state.items[0].description, description)
         self.assertEqual(issues, [])
 
     def test_escaped_backslash_before_a_quote_still_closes_the_string(self):
@@ -252,6 +256,67 @@ class BackupFormatTests(unittest.TestCase):
         from_dict.assert_not_called()
         self.assertIn("at most %d participant entries" % MAX_PARTICIPANT_REFS,
                       str(ctx.exception))
+
+    def test_names_and_descriptions_are_capped(self):
+        # len() counts code points; the inputs' HTML maxlength counts UTF-16
+        # units, so the browser is never looser than this check.
+        def backup(name, description):
+            return json.dumps({
+                "people": [{"id": "p1", "name": name}],
+                "items": [{"id": "i1", "description": description,
+                           "amount_cents": 100, "payer_id": "p1",
+                           "participant_ids": ["p1"],
+                           "split": {"mode": "equal"}}],
+            })
+
+        self.storage.parse_backup(
+            backup("n" * MAX_NAME_LENGTH, "d" * MAX_DESCRIPTION_LENGTH))
+        cases = (
+            (backup("n" * (MAX_NAME_LENGTH + 1), "d"),
+             "Names can be at most %d characters." % MAX_NAME_LENGTH),
+            (backup("n", "d" * (MAX_DESCRIPTION_LENGTH + 1)),
+             "Descriptions can be at most %d characters."
+             % MAX_DESCRIPTION_LENGTH),
+        )
+        for text, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as ctx:
+                    self.storage.parse_backup(text)
+                self.assertEqual(str(ctx.exception), message)
+
+    def test_backup_whose_reexport_exceeds_the_limit_is_rejected(self):
+        # Integer ids come back quoted, so this state's export is larger than
+        # the file itself: the file passes the pre-read size check and must
+        # still be refused, or its own export could not be restored.
+        text = json.dumps({"people": [{"id": 1, "name": "A"}], "items": []})
+        exported = len(self.storage.dumps(AppState(people=[Person("1", "A")])))
+        self.assertGreater(exported, len(text))
+
+        with mock.patch.object(self.storage, "MAX_BACKUP_BYTES", len(text)):
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(text)
+
+        self.assertIn("too large to back up", str(ctx.exception))
+
+    def test_check_restorable_returns_the_export_text(self):
+        state = AppState(people=[Person("p1", "A")])
+
+        self.assertEqual(self.storage.check_restorable(state),
+                         self.storage.dumps(state))
+
+    def test_export_size_is_measured_in_utf8_bytes(self):
+        text = "\U0001F600" * 10  # 10 code points, 40 bytes
+
+        with mock.patch.object(self.storage, "MAX_BACKUP_BYTES", 39):
+            with self.assertRaises(ValueError):
+                self.storage.check_export_size(text)
+        with mock.patch.object(self.storage, "MAX_BACKUP_BYTES", 40):
+            self.storage.check_export_size(text)
+
+    def test_save_can_reuse_already_serialized_text(self):
+        self.storage.save(AppState(), text="precomputed")
+
+        self.assertEqual(self.local.values["bunnysplit"], "precomputed")
 
     def test_negative_size_counts_as_too_large(self):
         # MicroPython's jsffi truncates JS numbers to int32, so a multi-GiB
@@ -491,6 +556,30 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(link.href.split(",", 1)[1],
                          self.ui._storage.dumps(state))
         self.assertEqual(self.status.textContent, "")
+
+    def test_export_still_downloads_but_flags_a_bill_it_cannot_restore(self):
+        # A bill saved before the text caps existed may exceed them.
+        self.ui._state = AppState(people=[Person("p1", "n" * (MAX_NAME_LENGTH + 1))])
+
+        self.ui.on_export_state(None)
+
+        link = self.ui.document.body.appended[0]
+        self.assertEqual(link.click_count, 1)
+        self.assertIn("can't restore", self.status.textContent)
+        self.assertIn("Names can be at most", self.status.textContent)
+        self.assertEqual(self.status.className, "error")
+
+    def test_import_with_an_over_long_name_is_rejected(self):
+        original = AppState(people=[Person("p1", "Keep me")])
+        self.ui._state = original
+
+        self.import_text(json.dumps({
+            "people": [{"id": "p1", "name": "n" * (MAX_NAME_LENGTH + 1)}],
+            "items": []}))
+
+        self.assertIs(self.ui._state, original)
+        self.assertIsNone(self.saved())
+        self.assertEqual(self.status.className, "error")
 
     def test_import_into_an_empty_bill_applies_without_asking(self):
         field = self.import_text(BACKUP)
@@ -743,6 +832,65 @@ class BillLimitTests(unittest.TestCase):
             self.item_error.textContent,
             "A bill can have at most %d participant entries across all items."
             % MAX_PARTICIPANT_REFS)
+
+    def test_adding_a_person_with_an_over_long_name_is_rejected(self):
+        self.ui._state = AppState()
+        self.name_field.value = "n" * (MAX_NAME_LENGTH + 1)
+
+        self.ui.on_add_person(None)
+
+        self.assertEqual(self.ui._state.people, [])
+        self.assertEqual(self.people_error.textContent,
+                         "Names can be at most %d characters." % MAX_NAME_LENGTH)
+        self.assertEqual(self.name_field.value, "n" * (MAX_NAME_LENGTH + 1))
+
+    def test_adding_an_item_with_an_over_long_description_is_rejected(self):
+        self.ui._state = AppState(people=self.people(1))
+        self.fill_item_form(["p0"])
+        self.desc.value = "d" * (MAX_DESCRIPTION_LENGTH + 1)
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(self.ui._state.items, [])
+        self.assertEqual(
+            self.item_error.textContent,
+            "Descriptions can be at most %d characters." % MAX_DESCRIPTION_LENGTH)
+
+    def test_adding_an_item_that_would_make_the_backup_too_large_is_rejected(self):
+        self.ui._state = AppState(people=self.people(1))
+        storage = self.ui._storage
+        limit = len(storage.dumps(self.ui._state).encode()) + 10
+        self.fill_item_form(["p0"])
+
+        with mock.patch.object(storage, "MAX_BACKUP_BYTES", limit):
+            self.ui.on_add_item(None)
+
+        self.assertEqual(self.ui._state.items, [])
+        self.assertIn("too large to back up", self.item_error.textContent)
+        self.assertEqual(self.desc.value, "Lunch")  # form kept for editing
+
+    def test_a_legacy_bill_with_over_long_text_can_still_grow(self):
+        # Only the new record's text is checked when adding, so a bill saved
+        # before the caps existed is not stuck.
+        self.ui._state = AppState(
+            people=[Person("old", "n" * (MAX_NAME_LENGTH + 5))])
+        self.name_field.value = "Bo"
+
+        self.ui.on_add_person(None)
+
+        self.assertEqual([p.name for p in self.ui._state.people][1:], ["Bo"])
+        self.assertEqual(self.people_error.textContent, "")
+
+    def test_each_add_serializes_the_bill_once(self):
+        # dumps() is quadratic in output size under MicroPython, so the size
+        # check's serialization is reused for the save.
+        self.ui._state = AppState()
+        self.name_field.value = "Bo"
+        with mock.patch.object(self.ui._storage, "dumps",
+                               wraps=self.ui._storage.dumps) as dumps:
+            self.ui.on_add_person(None)
+
+        self.assertEqual(dumps.call_count, 1)
 
     def test_adding_an_item_below_the_limits_still_works(self):
         self.ui._state = AppState(people=self.people(2))
