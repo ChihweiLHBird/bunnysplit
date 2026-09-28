@@ -112,7 +112,7 @@ Browser
 - **`splitcore/`** — Pure Python. No DOM, no `pyscript`, no browser APIs. This is the only code that needs to behave identically under CPython (tests) and MicroPython (browser).
 - **`ui.py`** + **`storage.py`** — Browser-only. Talk to the DOM and `localStorage`.
 - **`main.py`** — Tiny bootstrap: load state then hand off to the UI.
-- All money values are stored and settled as integer cents. `MAX_CENTS` and weight caps (`_MAX_WEIGHT`) keep the uneven-split math safe and exact. Floating point is used only for proportions during uneven splits and immediately converted to integer pennies.
+- All money values are stored and settled as integer cents. `MAX_CENTS` and weight caps (`MAX_WEIGHT`) keep the uneven-split math safe and exact. Floating point is used only for proportions during uneven splits and immediately converted to integer pennies.
 
 ---
 

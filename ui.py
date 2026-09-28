@@ -23,8 +23,8 @@ from splitcore.calc import (
 )
 from splitcore.model import (
     MAX_CENTS, MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH,
-    MAX_PARTICIPANT_REFS, MAX_PEOPLE, AppState, MODE_EQUAL, MODE_UNEVEN, Item,
-    Person)
+    MAX_PARTICIPANT_REFS, MAX_PEOPLE, MAX_WEIGHT, AppState, MODE_EQUAL,
+    MODE_UNEVEN, Item, Person)
 
 _state: AppState = None  # type: ignore  # bound in start()
 _storage = None
@@ -136,11 +136,14 @@ def _paid_by_person():
 
 
 def _fmt_weight(w):
-    # Show the weight split_item() uses. Never int() the stored value:
-    # MicroPython's int() of a long digit string is quadratic.
+    # Show the weight split_item() uses, capped at MAX_WEIGHT. Never int()
+    # the stored value: MicroPython's int() of a long digit string is
+    # quadratic, and int() of a float near 1e308 builds a 309-digit bigint.
     f = parse_finite(w)
     if f is None or f <= 0:
         return "0"
+    if f > MAX_WEIGHT:
+        f = MAX_WEIGHT
     if f == int(f):
         return str(int(f))
     return ("%.2f" % f).rstrip("0").rstrip(".")
@@ -657,6 +660,10 @@ def on_add_item(event):
                 if val < 0:
                     err.textContent = "Weights cannot be negative."
                     return
+                # split_item() would cap it, and import would report it.
+                if val > MAX_WEIGHT:
+                    err.textContent = "Weights are unreasonably large."
+                    return
                 weights[pid] = val
         if sum(weights.values()) <= 0:
             err.textContent = "Weights cannot all be zero."
@@ -798,7 +805,9 @@ def _on_import_text(text):
 
 
 def _on_import_read_error(err):
-    window.console.warn("bunnysplit: could not read import: " + str(err))
+    # err is the JS rejection reason (e.g. a DOMException), passed whole:
+    # str() of a JS object is just "<JsProxy n>".
+    window.console.warn("bunnysplit: could not read import:", err)
     _set_backup_status("Could not read the selected file.", error=True)
 
 
@@ -837,7 +846,9 @@ def on_import_file_change(event):
     except ValueError as e:
         _set_backup_status(str(e), error=True)
     except Exception as e:
-        _on_import_read_error(e)
+        # A Python exception reaches JS as an opaque proxy; log it as text.
+        window.console.warn("bunnysplit: could not read import: " + str(e))
+        _set_backup_status("Could not read the selected file.", error=True)
     finally:
         # Reset so choosing the same file again still fires "change".
         field.value = ""

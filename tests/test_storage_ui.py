@@ -11,7 +11,7 @@ from unittest import mock
 
 from splitcore.model import (
     MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH, MAX_PARTICIPANT_REFS,
-    MAX_PEOPLE, AppState, Item, Person)
+    MAX_PEOPLE, MAX_WEIGHT, AppState, Item, Person)
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -34,9 +34,11 @@ class FakeLocalStorage:
 class FakeConsole:
     def __init__(self):
         self.warnings = []
+        self.calls = []  # raw arguments, as JS receives them
 
     def warn(self, *parts):
         self.warnings.append(" ".join(str(part) for part in parts))
+        self.calls.append(parts)
 
     def log(self, message):
         pass
@@ -597,6 +599,21 @@ class BackupFormatTests(unittest.TestCase):
         self.assertEqual([person.name for person in state.people], ["A"])
         self.assertEqual(len(issues), 1)
 
+    def test_weights_above_the_cap_are_capped_and_reported(self):
+        # Every limit admits 20,000 weights; at 1e308 each one took ~0.5 ms
+        # to show under MicroPython, on every render and page load.
+        text = ('{"people":[{"id":"p1","name":"Ann"},{"id":"p2","name":"Bob"}],'
+                '"items":[{"id":"i1","description":"x","amount_cents":500,'
+                '"payer_id":"p1","participant_ids":["p1","p2"],"split":'
+                '{"mode":"uneven","weights":{"p1":1e308,"p2":1e12}}}]}')
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(state.items[0].weights(),
+                         {"p1": MAX_WEIGHT, "p2": MAX_WEIGHT})
+        self.assertEqual(
+            issues, ["item: 1 weight exceeds MAX_WEIGHT; set to MAX_WEIGHT"])
+
     def test_escaped_nul_in_an_id_is_skipped_and_reported(self):
         # \u0000 has four hex digits, so it passes the escape check; the id
         # it decodes into must not reach the DOM (see the model test).
@@ -673,6 +690,17 @@ class FakeDocument:
 class FakeJsError(BaseException):
     """A JS exception reaching Python through MicroPython's jsffi: it unwinds
     through Python frames without running `except Exception`."""
+
+
+class FakeJsProxy:
+    """A JS object (e.g. a DOMException) reaching Python through jsffi: str()
+    of it hides its name and message."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __str__(self):
+        return "<JsProxy 7>"
 
 
 class FakePromise:
@@ -795,6 +823,21 @@ class UiBoundaryTests(unittest.TestCase):
         for weight, shown in cases:
             with self.subTest(weight=weight):
                 self.assertEqual(ui._fmt_weight(weight), shown)
+
+    def test_weights_above_the_cap_are_shown_as_the_split_uses_them(self):
+        # split_item() caps weights at MAX_WEIGHT. Formatting the raw value
+        # showed a 309-digit badge next to an even split and built a bigint
+        # per weight, ~0.5 ms each under MicroPython on every render.
+        ui = load_ui(FakePill())
+        cap = ui._fmt_weight(MAX_WEIGHT)
+        self.assertEqual(cap, "1000000000000")
+        for weight in (MAX_WEIGHT + 1, 5e12, 10 ** 40, 1e308,
+                       1.7976931348623157e308):
+            with self.subTest(weight=weight):
+                self.assertEqual(ui._fmt_weight(weight), cap)
+        both = Item("i", "x", 1000, "a", ["a", "b"],
+                    {"mode": "uneven", "weights": {"a": 1e308, "b": 1e12}})
+        self.assertEqual(ui._weights_summary(both), cap + "·" + cap)
 
 
 class DomElement(FakeElement):
@@ -1154,6 +1197,39 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(self.status.className, "error")
         self.assertEqual(field.value, "")
 
+    def test_a_read_rejection_logs_the_browser_error_itself(self):
+        # Under MicroPython, str() of the DOMException that rejects
+        # Blob.text() is only "<JsProxy n>", losing its name and message.
+        error = FakeJsProxy("NotReadableError")
+
+        self.import_file(FakeFile(error=error))
+
+        self.assertEqual(self.status.textContent,
+                         "Could not read the selected file.")
+        self.assertEqual(self.status.className, "error")
+        self.assertIn(("bunnysplit: could not read import:", error),
+                      self.ui.window.console.calls)
+        self.assertFalse(any(isinstance(part, str) and "<JsProxy" in part
+                             for call in self.ui.window.console.calls
+                             for part in call))
+
+    def test_a_python_error_before_reading_is_logged_as_text(self):
+        # A Python exception passed to JS as its own argument is an opaque
+        # PyProxy there, so it is logged as text instead.
+        no_slice = types.SimpleNamespace(size=10)
+
+        self.import_file(no_slice)
+
+        self.assertEqual(self.status.textContent,
+                         "Could not read the selected file.")
+        self.assertEqual(self.status.className, "error")
+        self.assertTrue(any(w.startswith("bunnysplit: could not read import: ")
+                            and "slice" in w
+                            for w in self.ui.window.console.warnings))
+        self.assertFalse(any(isinstance(part, BaseException)
+                             for call in self.ui.window.console.calls
+                             for part in call))
+
     def test_unexpected_import_failure_is_reported_not_raised(self):
         original = AppState(people=[Person("p1", "Keep me")])
         self.ui._state = original
@@ -1271,6 +1347,7 @@ class BillLimitTests(unittest.TestCase):
         self.payer = FakeElement()
         self.uneven = types.SimpleNamespace(checked=False)
         self.checks = []
+        self.weight_fields = []
         self.ui = load_ui(FakePill(), {
             "#people-error": self.people_error,
             "#item-error": self.item_error,
@@ -1279,7 +1356,7 @@ class BillLimitTests(unittest.TestCase):
             "#item-amount": self.amount,
             "#payer-select": self.payer,
             "#mode-uneven": self.uneven,
-        }, {".p-check": self.checks})
+        }, {".p-check": self.checks, ".p-weight": self.weight_fields})
         self.ui._storage = load_storage(FakeLocalStorage())
 
     def people(self, n):
@@ -1402,6 +1479,41 @@ class BillLimitTests(unittest.TestCase):
             self.ui.on_add_person(None)
 
         self.assertEqual(dumps.call_count, 1)
+
+    def fill_weights(self, weights):
+        self.uneven.checked = True
+        self.weight_fields[:] = [
+            types.SimpleNamespace(value=value,
+                                  getAttribute=lambda name, pid=pid: pid)
+            for pid, value in weights.items()]
+
+    def test_adding_an_item_with_a_weight_above_the_cap_is_rejected(self):
+        # split_item() would cap it, and a backup of it would be reported
+        # as changed on import.
+        self.ui._state = AppState(people=self.people(2))
+        self.fill_item_form(["p0", "p1"])
+        self.fill_weights({"p0": "1", "p1": "1e13"})
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(self.ui._state.items, [])
+        self.assertEqual(self.item_error.textContent,
+                         "Weights are unreasonably large.")
+        self.assertEqual(self.desc.value, "Lunch")  # form kept for editing
+
+    def test_a_weight_at_the_cap_is_added_and_restores_cleanly(self):
+        self.ui._state = AppState(people=self.people(2))
+        self.fill_item_form(["p0", "p1"])
+        self.fill_weights({"p0": "1", "p1": "1000000000000"})
+
+        self.ui.on_add_item(None)
+
+        self.assertEqual(self.item_error.textContent, "")
+        storage = self.ui._storage
+        restored, issues = storage.parse_backup(storage.dumps(self.ui._state))
+        self.assertEqual(restored.items[0].weights(),
+                         {"p0": 1.0, "p1": MAX_WEIGHT})
+        self.assertEqual(issues, [])
 
     def test_adding_an_item_below_the_limits_still_works(self):
         self.ui._state = AppState(people=self.people(2))

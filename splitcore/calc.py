@@ -4,11 +4,8 @@ Every function guarantees money conservation: the sum of allocated cents
 always equals the input amount exactly (no lost or invented pennies).
 """
 
-from splitcore.model import MAX_CENTS, MODE_EQUAL, MODE_UNEVEN
+from splitcore.model import MAX_CENTS, MAX_WEIGHT, MODE_EQUAL, MODE_UNEVEN
 
-# Cap weights so amount * weight can't overflow float (→ OverflowError).
-# Far above any real weight; with MAX_CENTS this keeps products well finite.
-_MAX_WEIGHT = 1e12
 _MAX_WHOLE_DIGITS = len(str(MAX_CENTS // 100))
 MAX_AMOUNT_INPUT_LENGTH = _MAX_WHOLE_DIGITS + 4  # sign, dot, two+ decimals
 
@@ -111,8 +108,8 @@ def split_item(item):
             v = parse_finite(weights.get(pid, 0))
             if v is None or v <= 0:
                 v = 0.0
-            elif v > _MAX_WEIGHT:
-                v = _MAX_WEIGHT
+            elif v > MAX_WEIGHT:
+                v = MAX_WEIGHT
             w.append(v)
         total_w = sum(w)
         # `not (> 0)` also rejects 0 and NaN totals; fall back to an equal

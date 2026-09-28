@@ -24,6 +24,7 @@ from splitcore.calc import (
 from splitcore.model import (
     MAX_CENTS,
     MAX_ID_LENGTH,
+    MAX_WEIGHT,
     MODE_EQUAL,
     MODE_UNEVEN,
     AppState,
@@ -737,6 +738,24 @@ class SplitSanitizingTests(unittest.TestCase):
 
         self.assertEqual(state.items[0].weights(), {"a": 1, "c": 0.5})
         self.assertEqual(len(issues), 4)
+        self.assert_strict_json(state)
+
+    def test_weights_above_the_cap_are_capped_with_one_issue(self):
+        # split_item() caps weights at MAX_WEIGHT anyway, so capping them here
+        # leaves the split as is and tells the importer the file was changed.
+        # Kept verbatim, 20,000 weights of 1e308 fit every backup limit and
+        # made each render take ~10 s under MicroPython.
+        weights = {"a": 1e308, "b": 10 ** 40, "c": MAX_WEIGHT, "d": 1}
+        before = split_item(item(1000, list("abcd"), split=uneven(dict(weights))))
+
+        state, issues = self._state(uneven(dict(weights)), ids="abcd")
+
+        self.assertEqual(state.items[0].weights(),
+                         {"a": MAX_WEIGHT, "b": MAX_WEIGHT, "c": MAX_WEIGHT,
+                          "d": 1})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(
+            issues, [("item", "2 weights exceed MAX_WEIGHT; set to MAX_WEIGHT")])
         self.assert_strict_json(state)
 
     def test_weights_for_non_participants_are_dropped_with_one_issue(self):

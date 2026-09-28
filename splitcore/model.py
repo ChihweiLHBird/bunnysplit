@@ -13,6 +13,9 @@ MODE_UNEVEN = "uneven"
 # values past ~2^53 cents lose integer precision, which can make the penny
 # remainder exceed the participant count (IndexError) or overflow to inf.
 MAX_CENTS = 10 ** 11
+# Cap weights so amount * weight can't overflow float (→ OverflowError).
+# Far above any real weight; with MAX_CENTS this keeps products well finite.
+MAX_WEIGHT = 1e12
 MAX_ID_LENGTH = 64
 # Supported bill size. Backup import rejects anything larger and the UI stops
 # adding at these limits, so every bill the app can build can be restored.
@@ -208,6 +211,8 @@ class Item:
         # extra keys would be parsed again on every load, and building a
         # big dict is superlinear under MicroPython (40,000 keys made each
         # page load take ~12 s), so drop them with a single issue.
+        # split_item() caps weights at MAX_WEIGHT; cap them here too (one
+        # issue per item), so the UI shows the weight the split uses.
         clean = {"mode": split["mode"]}
         if split["mode"] == MODE_UNEVEN and "weights" in split:
             weights = split["weights"]
@@ -218,10 +223,14 @@ class Item:
                 weights = {}
             clean["weights"] = {}
             extra = 0
+            capped = 0
             for pid, weight in weights.items():
                 if pid not in seen:
                     extra += 1
                 elif _valid_weight(weight):
+                    if weight > MAX_WEIGHT:
+                        capped += 1
+                        weight = MAX_WEIGHT
                     clean["weights"][pid] = weight
                 else:
                     _report_issue(on_issue, "item",
@@ -232,6 +241,11 @@ class Item:
                 _report_issue(on_issue, "item",
                               "dropped %d %s for non-participants"
                               % (extra, noun), record, kept=True)
+            if capped:
+                _report_issue(on_issue, "item",
+                              "%d %s MAX_WEIGHT; set to MAX_WEIGHT"
+                              % (capped, "weight exceeds" if capped == 1
+                                 else "weights exceed"), record, kept=True)
         if len(clean) != len(split):
             _report_issue(on_issue, "item", "dropped unknown split fields",
                           record, kept=True)
