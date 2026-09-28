@@ -374,7 +374,8 @@ def parse_backup(text):
         window.console.warn("bunnysplit: " + issue)
         issues.append(issue)
     state = AppState.from_dict(
-        raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
+        raw, report_caps=True,
+        on_issue=lambda kind, message: issues.append(kind + ": " + message))
     # Text lengths and the re-export size can only be judged after from_dict()
     # (it str()s scalar names, and quotes integer ids). The re-export is in
     # the app's format, which can be larger than a minified file.

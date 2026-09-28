@@ -686,14 +686,15 @@ class SplitSanitizingTests(unittest.TestCase):
     whole bill. split_item() already treats a non-finite weight as 0, so
     dropping one does not change the computed split."""
 
-    def _state(self, split, ids="ab"):
+    def _state(self, split, ids="ab", **kwargs):
         issues = []
         state = AppState.from_dict(
             {"people": [{"id": pid, "name": pid.upper()} for pid in ids],
              "items": [{"id": "i", "description": "x", "amount_cents": 1000,
                         "payer_id": "a", "participant_ids": list(ids),
                         "split": split}]},
-            on_issue=lambda kind, message: issues.append((kind, message)))
+            on_issue=lambda kind, message: issues.append((kind, message)),
+            **kwargs)
         return state, issues
 
     def assert_strict_json(self, state):
@@ -740,23 +741,60 @@ class SplitSanitizingTests(unittest.TestCase):
         self.assertEqual(len(issues), 4)
         self.assert_strict_json(state)
 
-    def test_weights_above_the_cap_are_capped_with_one_issue(self):
+    def test_weights_above_the_cap_are_capped_silently(self):
         # split_item() caps weights at MAX_WEIGHT anyway, so capping them here
-        # leaves the split as is and tells the importer the file was changed.
-        # Kept verbatim, 20,000 weights of 1e308 fit every backup limit and
-        # made each render take ~10 s under MicroPython.
+        # leaves the split as is. Kept verbatim, 20,000 weights of 1e308 fit
+        # every backup limit and made each render take ~10 s under
+        # MicroPython. The previous release saved typed weights above the
+        # cap, so a saved bill holding one is not malformed: no issue, no
+        # console line.
         weights = {"a": 1e308, "b": 10 ** 40, "c": MAX_WEIGHT, "d": 1}
         before = split_item(item(1000, list("abcd"), split=uneven(dict(weights))))
+        err = io.StringIO()
 
-        state, issues = self._state(uneven(dict(weights)), ids="abcd")
+        with contextlib.redirect_stderr(err):
+            state, issues = self._state(uneven(dict(weights)), ids="abcd")
 
         self.assertEqual(state.items[0].weights(),
                          {"a": MAX_WEIGHT, "b": MAX_WEIGHT, "c": MAX_WEIGHT,
                           "d": 1})
         self.assertEqual(split_item(state.items[0]), before)
-        self.assertEqual(
-            issues, [("item", "2 weights exceed MAX_WEIGHT; set to MAX_WEIGHT")])
+        self.assertEqual(issues, [])
+        self.assertEqual(err.getvalue(), "")
         self.assert_strict_json(state)
+
+    def test_weights_below_minus_the_cap_are_capped(self):
+        # MicroPython's json.dumps writes 16 significant digits, so
+        # -1.7976931348623157e308 saves as -1.797693134862316e+308, past
+        # the largest float: the next load reads -inf and drops it. Ordinary
+        # negatives are kept; split_item() treats every one as 0.
+        split = json.loads('{"mode": "uneven", "weights": '
+                           '{"a": -1.7976931348623157e308, "b": -5, "c": 1}}')
+        before = split_item(item(1000, list("abc"), split=dict(split)))
+
+        state, issues = self._state(split, ids="abc")
+
+        weights = state.items[0].weights()
+        self.assertEqual(weights, {"a": -MAX_WEIGHT, "b": -5, "c": 1})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(issues, [])
+        for weight in weights.values():  # as MicroPython's dumps writes it
+            self.assertTrue(is_finite_number(float("%.16g" % weight)))
+
+    def test_capped_weights_are_one_issue_per_item_when_reported(self):
+        # Backup import asks for the report, so the importer learns the
+        # file was changed.
+        state, issues = self._state(
+            uneven({"a": 1e308, "b": -1e308, "c": MAX_WEIGHT, "d": -5}),
+            ids="abcd", report_caps=True)
+
+        self.assertEqual(state.items[0].weights(),
+                         {"a": MAX_WEIGHT, "b": -MAX_WEIGHT, "c": MAX_WEIGHT,
+                          "d": -5})
+        self.assertEqual(
+            issues,
+            [("item", "2 weights are outside +/-MAX_WEIGHT; "
+                      "set to the nearest limit")])
 
     def test_weights_for_non_participants_are_dropped_with_one_issue(self):
         # split_item() reads only participants' weights, and the app writes

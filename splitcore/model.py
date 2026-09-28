@@ -159,7 +159,7 @@ class Item:
         }
 
     @staticmethod
-    def from_dict(d, on_issue=None):
+    def from_dict(d, on_issue=None, report_caps=False):
         # Dedup participants in source order. Without this, hand-edited
         # or corrupted state with duplicate ids would silently lose
         # money: both split paths key shares by participant_id, so a
@@ -211,8 +211,14 @@ class Item:
         # extra keys would be parsed again on every load, and building a
         # big dict is superlinear under MicroPython (40,000 keys made each
         # page load take ~12 s), so drop them with a single issue.
-        # split_item() caps weights at MAX_WEIGHT; cap them here too (one
-        # issue per item), so the UI shows the weight the split uses.
+        # split_item() caps weights at MAX_WEIGHT; cap them here too, so the
+        # UI shows the weight the split uses, and below at -MAX_WEIGHT: a
+        # weight near -1.8e308 (still 0 to split_item()) is written by
+        # MicroPython's 16-digit json.dumps past the largest float, and the
+        # next load reads -inf. The previous release saved typed weights
+        # above the cap, so a saved bill is not malformed for holding one:
+        # the cap is an issue (one per item) only when report_caps asks, as
+        # import does.
         clean = {"mode": split["mode"]}
         if split["mode"] == MODE_UNEVEN and "weights" in split:
             weights = split["weights"]
@@ -231,6 +237,9 @@ class Item:
                     if weight > MAX_WEIGHT:
                         capped += 1
                         weight = MAX_WEIGHT
+                    elif weight < -MAX_WEIGHT:
+                        capped += 1
+                        weight = -MAX_WEIGHT
                     clean["weights"][pid] = weight
                 else:
                     _report_issue(on_issue, "item",
@@ -241,11 +250,12 @@ class Item:
                 _report_issue(on_issue, "item",
                               "dropped %d %s for non-participants"
                               % (extra, noun), record, kept=True)
-            if capped:
+            if capped and report_caps:
                 _report_issue(on_issue, "item",
-                              "%d %s MAX_WEIGHT; set to MAX_WEIGHT"
-                              % (capped, "weight exceeds" if capped == 1
-                                 else "weights exceed"), record, kept=True)
+                              "%d %s outside +/-MAX_WEIGHT; set to the "
+                              "nearest limit"
+                              % (capped, "weight is" if capped == 1
+                                 else "weights are"), record, kept=True)
         if len(clean) != len(split):
             _report_issue(on_issue, "item", "dropped unknown split fields",
                           record, kept=True)
@@ -326,7 +336,8 @@ class AppState:
         }
 
     @staticmethod
-    def from_dict(d, on_issue=None):
+    def from_dict(d, on_issue=None, report_caps=False):
+        # report_caps: see Item.from_dict().
         if not isinstance(d, dict):
             _report_issue(on_issue, "state", "top-level value is not an object")
             return AppState()
@@ -363,7 +374,8 @@ class AppState:
         for i in raw_items:
             record = _label(i, "description")
             try:
-                it = Item.from_dict(i, on_issue=on_issue)
+                it = Item.from_dict(i, on_issue=on_issue,
+                                    report_caps=report_caps)
             except Exception as e:
                 _report_issue(on_issue, "item", e, record)
                 continue

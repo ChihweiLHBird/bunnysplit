@@ -9,6 +9,7 @@ import types
 import unittest
 from unittest import mock
 
+from splitcore.calc import split_item
 from splitcore.model import (
     MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH, MAX_PARTICIPANT_REFS,
     MAX_PEOPLE, MAX_WEIGHT, AppState, Item, Person)
@@ -118,6 +119,37 @@ class StorageRecoveryTests(unittest.TestCase):
         self.assertEqual(local.values["bunnysplit:corrupt:1"], current_corrupt)
         self.assertNotIn("bunnysplit:corrupt:2", local.values)
         self.assertIn("bunnysplit:corrupt:1", storage.recovery_warning())
+
+    def test_saved_weight_above_the_cap_loads_without_a_recovery_warning(self):
+        # The previous release saved typed weights above the cap (and
+        # split_item() capped them), so capping one on load changes no share
+        # and must not flag the bill as corrupt; the warning and the corrupt
+        # key would never clear.
+        raw = json.dumps({
+            "people": [{"id": "p1", "name": "Ann"},
+                       {"id": "p2", "name": "Bob"}],
+            "items": [{
+                "id": "i3", "description": "Rent", "amount_cents": 100000,
+                "payer_id": "p1", "participant_ids": ["p1", "p2"],
+                "split": {"mode": "uneven",
+                          "weights": {"p1": 2000000000000.0, "p2": 1.0}},
+            }],
+        })
+        local = FakeLocalStorage({"bunnysplit": raw})
+        storage = load_storage(local)
+
+        state = storage.load()
+
+        self.assertEqual(state.items[0].weights(),
+                         {"p1": MAX_WEIGHT, "p2": 1.0})
+        self.assertEqual(split_item(state.items[0]),
+                         {"p1": 100000, "p2": 0})
+        self.assertEqual(storage.recovery_warning(), "")
+        self.assertEqual(list(local.values), ["bunnysplit"])
+        # Importing the same bill still says the file was changed.
+        _, issues = storage.parse_backup(raw)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("MAX_WEIGHT", issues[0])
 
 
 class BackupFormatTests(unittest.TestCase):
@@ -612,7 +644,31 @@ class BackupFormatTests(unittest.TestCase):
         self.assertEqual(state.items[0].weights(),
                          {"p1": MAX_WEIGHT, "p2": MAX_WEIGHT})
         self.assertEqual(
-            issues, ["item: 1 weight exceeds MAX_WEIGHT; set to MAX_WEIGHT"])
+            issues, ["item: 1 weight is outside +/-MAX_WEIGHT; "
+                     "set to the nearest limit"])
+
+    def test_weight_below_minus_the_cap_is_capped_and_restores_cleanly(self):
+        # MicroPython's json.dumps writes -1.7976931348623157e308 with 16
+        # digits, past the largest float, so kept verbatim it passed export
+        # and reloaded as -inf: re-import reported a problem and every page
+        # load warned of corrupt data.
+        text = ('{"people":[{"id":"p1","name":"A"},{"id":"p2","name":"B"}],'
+                '"items":[{"id":"i1","description":"x","amount_cents":1000,'
+                '"payer_id":"p1","participant_ids":["p1","p2"],"split":'
+                '{"mode":"uneven","weights":'
+                '{"p1":-1.7976931348623157e308,"p2":1}}}]}')
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(state.items[0].weights(),
+                         {"p1": -MAX_WEIGHT, "p2": 1})
+        self.assertEqual(len(issues), 1)
+        self.assertIn("MAX_WEIGHT", issues[0])
+        restored, issues = self.storage.parse_backup(
+            self.storage.check_restorable(state))
+        self.assertEqual(restored.items[0].weights(),
+                         {"p1": -MAX_WEIGHT, "p2": 1})
+        self.assertEqual(issues, [])
 
     def test_escaped_nul_in_an_id_is_skipped_and_reported(self):
         # \u0000 has four hex digits, so it passes the escape check; the id
