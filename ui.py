@@ -22,7 +22,9 @@ from splitcore.calc import (
     settle_up,
 )
 from splitcore.model import (
-    MAX_CENTS, AppState, MODE_EQUAL, MODE_UNEVEN, Item, Person)
+    MAX_CENTS, MAX_DESCRIPTION_LENGTH, MAX_ITEMS, MAX_NAME_LENGTH,
+    MAX_PARTICIPANT_REFS, MAX_PEOPLE, MAX_WEIGHT, AppState, MODE_EQUAL,
+    MODE_UNEVEN, Item, Person)
 
 _state: AppState = None  # type: ignore  # bound in start()
 _storage = None
@@ -134,12 +136,17 @@ def _paid_by_person():
 
 
 def _fmt_weight(w):
-    try:
-        if w == int(w):
-            return str(int(w))
-        return ("%.2f" % float(w)).rstrip("0").rstrip(".")
-    except (ValueError, TypeError):
+    # Show the weight split_item() uses, capped at MAX_WEIGHT. Never int()
+    # the stored value: MicroPython's int() of a long digit string is
+    # quadratic, and int() of a float near 1e308 builds a 309-digit bigint.
+    f = parse_finite(w)
+    if f is None or f <= 0:
         return "0"
+    if f > MAX_WEIGHT:
+        f = MAX_WEIGHT
+    if f == int(f):
+        return str(int(f))
+    return ("%.2f" % f).rstrip("0").rstrip(".")
 
 
 def _weights_summary(item):
@@ -498,13 +505,14 @@ def _set_save_status(ok, detail=""):
         pill.title = msg
 
 
-def _persist_and_render():
+def _persist_and_render(text=None):
     """Save then re-render. A storage failure (quota, private mode) must
     not desync memory from the DOM or surface a traceback. We log,
     flip the pill to show the failure, and still render so the user
-    can keep working in-memory."""
+    can keep working in-memory. text: the state's dumps() if the caller
+    already serialized it."""
     try:
-        _storage.save(_state)
+        _storage.save(_state, text)
         _set_save_status(True)
     except Exception as e:
         window.console.warn("bunnysplit: could not save: " + str(e))
@@ -514,19 +522,44 @@ def _persist_and_render():
 
 # ---------- handlers ----------
 
+def _fits_backup_or_undo(records, err):
+    """Return the state's export text, or undo the record just appended to
+    `records` if the bill would no longer fit in a restorable backup. Only
+    the export size is checked here, so a bill saved before the text caps
+    existed can still grow; the text is reused for the save."""
+    text = _storage.dumps(_state)
+    try:
+        _storage.check_export_size(text)
+    except ValueError as e:
+        records.pop()
+        err.textContent = str(e)
+        return None
+    return text
+
+
 def on_add_person(event):
     field = _qs("#person-name")
     name = field.value.strip()
     err = _qs("#people-error")
+    # Same limits as backup import, so every bill can be restored.
+    if len(_state.people) >= MAX_PEOPLE:
+        err.textContent = "A bill can have at most %d people." % MAX_PEOPLE
+        return
     if not name:
         err.textContent = "Enter a name."
         return
     if any(p.name == name for p in _state.people):
         err.textContent = "That name already exists."
         return
+    if len(name) > MAX_NAME_LENGTH:
+        err.textContent = "Names can be at most %d characters." % MAX_NAME_LENGTH
+        return
     _state.people.append(Person(_next_id("p"), name))
+    text = _fits_backup_or_undo(_state.people, err)
+    if text is None:
+        return
     field.value = ""
-    _persist_and_render()
+    _persist_and_render(text)
 
 
 def _make_remove_person(pid):
@@ -572,10 +605,18 @@ def _select_share_field(event):
 def on_add_item(event):
     err = _qs("#item-error")
     err.textContent = ""
+    # Same limits as backup import, so every bill can be restored.
+    if len(_state.items) >= MAX_ITEMS:
+        err.textContent = "A bill can have at most %d items." % MAX_ITEMS
+        return
 
     desc = _qs("#item-desc").value.strip()
     if not desc:
         err.textContent = "Enter a description."
+        return
+    if len(desc) > MAX_DESCRIPTION_LENGTH:
+        err.textContent = ("Descriptions can be at most %d characters."
+                           % MAX_DESCRIPTION_LENGTH)
         return
 
     amount_cents = parse_cents(_qs("#item-amount").value)
@@ -599,6 +640,12 @@ def on_add_item(event):
     if not participant_ids:
         err.textContent = "Pick at least one participant."
         return
+    refs = sum(len(i.participant_ids) for i in _state.items)
+    if refs + len(participant_ids) > MAX_PARTICIPANT_REFS:
+        err.textContent = (
+            "A bill can have at most %d participant entries across all items."
+            % MAX_PARTICIPANT_REFS)
+        return
 
     uneven = _qs("#mode-uneven").checked
     if uneven:
@@ -613,6 +660,10 @@ def on_add_item(event):
                 if val < 0:
                     err.textContent = "Weights cannot be negative."
                     return
+                # split_item() would cap it, and import would report it.
+                if val > MAX_WEIGHT:
+                    err.textContent = "Weights are unreasonably large."
+                    return
                 weights[pid] = val
         if sum(weights.values()) <= 0:
             err.textContent = "Weights cannot all be zero."
@@ -623,9 +674,12 @@ def on_add_item(event):
 
     _state.items.append(Item(
         _next_id("i"), desc, amount_cents, payer_id, participant_ids, split))
+    text = _fits_backup_or_undo(_state.items, err)
+    if text is None:
+        return
     _qs("#item-desc").value = ""
     _qs("#item-amount").value = ""
-    _persist_and_render()
+    _persist_and_render(text)
 
 
 def _make_remove_item(iid):
@@ -633,6 +687,171 @@ def _make_remove_item(iid):
         _state.items = [i for i in _state.items if i.id != iid]
         _persist_and_render()
     return handler
+
+
+# ---------- backup: export / import ----------
+
+# Proxies for the file-read promise: created on the first import, then
+# reused. The promise settles after on_import_file_change returns, so they
+# can't be render-scoped, and destroying a per-import set from inside its
+# own callback would free the proxy that is still executing (see render_all).
+_import_callbacks = None
+
+
+def _count(n, singular, plural):
+    return "%d %s" % (n, singular if n == 1 else plural)
+
+
+def _bill_summary(state):
+    return "%s, %s" % (_count(len(state.people), "person", "people"),
+                       _count(len(state.items), "item", "items"))
+
+
+def _issues_note(issues):
+    # One record can have several problems, so count problems, not records.
+    n = len(issues)
+    return ("1 problem was" if n == 1 else "%d problems were" % n) + (
+        " fixed or skipped")
+
+
+def _set_backup_status(text, error=False):
+    node = _qs("#backup-status")
+    node.textContent = text
+    node.className = "error" if error else "status"
+
+
+def on_export_state(event):
+    # Same serialization as localStorage, so a backup restores exactly what
+    # was saved. Always export, but flag a bill (e.g. saved before the
+    # limits existed) that this app's import would refuse.
+    try:
+        text = _storage.check_restorable(
+            _state, "it is %d KiB, over the %d KiB limit.")
+        problem = None
+    except ValueError as e:
+        text = _storage.dumps(_state)
+        problem = str(e)
+    href = ("data:application/json;charset=utf-8,"
+            + window.encodeURIComponent(text))
+    link = _el("a")
+    link.href = href
+    link.download = "bunnysplit-export.json"
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    if problem:
+        _set_backup_status(
+            "Exported, but this app can't restore that file: " + problem,
+            error=True)
+    else:
+        _set_backup_status("")
+
+
+def on_import_click(event):
+    _qs("#import-file").click()
+
+
+def _import_backup(text):
+    global _state
+    try:
+        new_state, issues = _storage.parse_backup(text)
+    except ValueError as e:
+        _set_backup_status(str(e), error=True)
+        return
+    if _state.people or _state.items:
+        question = (
+            "Replace the current bill (%s) with the imported one (%s)? "
+            "This can't be undone; export first to keep a copy."
+            % (_bill_summary(_state), _bill_summary(new_state)))
+        if issues:
+            question += "\n\n%s while reading the file." % _issues_note(issues)
+        if not window.confirm(question):
+            _set_backup_status("Import cancelled; your current bill was kept.")
+            return
+    # Save before swapping the bill in. Under MicroPython a JS exception
+    # (e.g. QuotaExceededError from localStorage.setItem) unwinds through
+    # Python without running except or finally, so show the failure first
+    # and replace it only once the save has returned.
+    _set_backup_status(
+        "Could not save the imported bill; your current bill was kept.",
+        error=True)
+    try:
+        _storage.save(new_state)
+    except Exception as e:
+        window.console.warn(
+            "bunnysplit: could not save the imported bill: " + str(e))
+        return
+    _state = new_state
+    message = "Imported %s and %s." % (
+        _count(len(_state.people), "person", "people"),
+        _count(len(_state.items), "item", "items"))
+    if issues:
+        message += " %s; see the browser console for details." % (
+            _issues_note(issues))
+    _set_backup_status(message)
+    _seed_counter()
+    _set_save_status(True)
+    render_all()
+
+
+def _on_import_text(text):
+    # Promise callback: an escaped exception would only reach the console
+    # and leave the user without feedback.
+    try:
+        _import_backup(text)
+    except Exception as e:
+        window.console.warn("bunnysplit: import failed: " + str(e))
+        _set_backup_status("Import failed: " + str(e), error=True)
+
+
+def _on_import_read_error(err):
+    # err is the JS rejection reason (e.g. a DOMException), passed whole:
+    # str() of a JS object is just "<JsProxy n>".
+    window.console.warn("bunnysplit: could not read import:", err)
+    _set_backup_status("Could not read the selected file.", error=True)
+
+
+def _on_import_failed(err):
+    # Trailing catch of the read promise: an error escaped the handlers
+    # above, which under MicroPython any JS exception does. err is passed
+    # whole because str() of a JS error proxy is just "<JsProxy n>". Keep a
+    # more specific message if one is already showing.
+    window.console.warn("bunnysplit: import failed:", err)
+    if not _qs("#backup-status").textContent:
+        _set_backup_status(
+            "Import failed; see the browser console for details.", error=True)
+
+
+def on_import_file_change(event):
+    global _import_callbacks
+    _set_backup_status("")
+    field = event.target
+    files = field.files
+    if not files or files.length == 0:
+        return
+    file = files.item(0)
+    try:
+        _storage.check_backup_size(file.size)
+        if _import_callbacks is None:
+            _import_callbacks = (create_proxy(_on_import_text),
+                                 create_proxy(_on_import_read_error),
+                                 create_proxy(_on_import_failed))
+        on_text, on_read_error, on_failed = _import_callbacks
+        # file.size can wrap to a small value for files over 4 GiB (int32
+        # truncation), so also cap the read itself; parse_backup() refuses
+        # text over the limit.
+        limit = _storage.MAX_BACKUP_BYTES + 1
+        file.slice(0, limit).text().then(on_text, on_read_error).catch(
+            on_failed)
+    except ValueError as e:
+        _set_backup_status(str(e), error=True)
+    except Exception as e:
+        # A Python exception reaches JS as an opaque proxy; log it as text.
+        window.console.warn("bunnysplit: could not read import: " + str(e))
+        _set_backup_status("Could not read the selected file.", error=True)
+    finally:
+        # Reset so choosing the same file again still fires "change".
+        field.value = ""
 
 
 # ---------- entry ----------
@@ -673,8 +892,20 @@ def start(state, storage_module):
     _storage = storage_module
     _seed_counter()
     _qs("#item-amount").maxLength = MAX_AMOUNT_INPUT_LENGTH
+    _qs("#person-name").maxLength = MAX_NAME_LENGTH
+    _qs("#item-desc").maxLength = MAX_DESCRIPTION_LENGTH
     _on(_qs("#add-person"), "click", on_add_person, track=False)
     _on(_qs("#add-item"), "click", on_add_item, track=False)
+    # The Backup panel is newer than the rest of the page. During a service
+    # worker update this ui.py can run under the cached older index.html,
+    # which must still render the bill; the panel appears on the next load.
+    for sel, event, handler in (
+            ("#export-state", "click", on_export_state),
+            ("#import-state", "click", on_import_click),
+            ("#import-file", "change", on_import_file_change)):
+        node = _qs(sel)
+        if node is not None:
+            _on(node, event, handler, track=False)
     parts = _qs("#participants")
     _on(parts, "focusin", _select_share_field, track=False)
     render_all()

@@ -13,26 +13,81 @@ MODE_UNEVEN = "uneven"
 # values past ~2^53 cents lose integer precision, which can make the penny
 # remainder exceed the participant count (IndexError) or overflow to inf.
 MAX_CENTS = 10 ** 11
+# Cap weights so amount * weight can't overflow float (→ OverflowError).
+# Far above any real weight; with MAX_CENTS this keeps products well finite.
+MAX_WEIGHT = 1e12
 MAX_ID_LENGTH = 64
+# Supported bill size. Backup import rejects anything larger and the UI stops
+# adding at these limits, so every bill the app can build can be restored.
+# Measured under MicroPython 1.24: settle_up() is quadratic in people (2000
+# took 4.4 s) and each render walks every participant entry twice.
+MAX_PEOPLE = 200
+MAX_ITEMS = 1000
+MAX_PARTICIPANT_REFS = 20000
+# Names repeat in every item row they appear in ("Among ...", payer), so an
+# uncapped name multiplies rendered text by the item count.
+MAX_NAME_LENGTH = 60
+MAX_DESCRIPTION_LENGTH = 120
 
 
-def _warn_skip(kind, exc):
-    # Surface dropped records so silent data loss / dev-time API breaks
-    # are visible. PyScript routes stderr to the browser console.
+def _warn(kind, exc, record, kept):
+    # Surface dropped or changed records so silent data loss / dev-time API
+    # breaks are visible. PyScript routes stderr to the browser console,
+    # where backup import sends users for details, so name the record and
+    # say whether it was kept with a change ("fixed") or left out.
     try:
-        print("bunnysplit: skipped malformed " + kind + " record: " + str(exc),
-              file=sys.stderr)
+        print("bunnysplit: %s %s record%s: %s" % (
+            "fixed" if kept else "skipped malformed", kind,
+            " " + record if record else "", exc), file=sys.stderr)
     except Exception:
         pass
 
 
-def _report_issue(on_issue, kind, exc):
-    _warn_skip(kind, exc)
+def _report_issue(on_issue, kind, exc, record="", kept=False):
+    _warn(kind, exc, record, kept)
     if on_issue is not None:
         try:
             on_issue(kind, str(exc))
         except Exception:
             pass
+
+
+def _valid_weight(value):
+    # A finite int or float, the only weights the app saves. A float from an
+    # overflowing literal (1e309) is inf, which json.dumps emits as a bare
+    # inf/Infinity that json.loads rejects. A string would reach the UI's
+    # weight formatting, where MicroPython's int() of a long digit string is
+    # quadratic. MicroPython lacks math.isfinite, so test NaN by
+    # self-inequality and inf by abs().
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and value == value and (
+        abs(value) != float("inf"))
+
+
+def _text(value, kind):
+    # str() of a deeply nested list recurses in C; under MicroPython on wasm
+    # that overflows the JS stack, which no Python except clause catches.
+    if isinstance(value, (list, tuple, dict)):
+        raise ValueError(kind + " is not text")
+    return str(value)
+
+
+def _label(d, text_key):
+    # Name a raw record in console lines by its id and name or description.
+    # Only strings and integers are used (see _text()).
+    if not isinstance(d, dict):
+        return ""
+    parts = []
+    rid = d.get("id")
+    if isinstance(rid, (str, int)) and not isinstance(rid, bool):
+        parts.append("'%s'" % str(rid)[:MAX_ID_LENGTH])
+    text = d.get(text_key)
+    if isinstance(text, str) and text:
+        parts.append("(%s)" % text[:MAX_DESCRIPTION_LENGTH])
+    return " ".join(parts)
 
 
 def _normalize_id(value, kind):
@@ -43,6 +98,11 @@ def _normalize_id(value, kind):
         raise ValueError(kind + " id is empty")
     if len(identifier) > MAX_ID_LENGTH:
         raise ValueError(kind + " id exceeds %d characters" % MAX_ID_LENGTH)
+    # MicroPython's jsffi cuts a str at its first NUL when it reaches JS, so
+    # the DOM would hold another id ("p2" for "p2\x00", or another person's)
+    # and the UI would record shares for the wrong person or for nobody.
+    if "\x00" in identifier:
+        raise ValueError(kind + " id contains a NUL character")
     return identifier
 
 
@@ -56,7 +116,8 @@ class Person:
 
     @staticmethod
     def from_dict(d):
-        return Person(_normalize_id(d["id"], "person"), str(d["name"]))
+        return Person(_normalize_id(d["id"], "person"),
+                      _text(d["name"], "person name"))
 
 
 class Item:
@@ -98,16 +159,19 @@ class Item:
         }
 
     @staticmethod
-    def from_dict(d, on_issue=None):
+    def from_dict(d, on_issue=None, report_caps=False):
         # Dedup participants in source order. Without this, hand-edited
         # or corrupted state with duplicate ids would silently lose
         # money: both split paths key shares by participant_id, so a
         # repeat overwrites the prior share instead of representing a
         # second portion. The UI's checkbox-based picker can't produce
         # duplicates, but the model layer is the trust boundary.
+        record = _label(d, "description")
+        in_item = "in item " + record if record else ""
         raw_pids = d.get("participant_ids", [])
         if not isinstance(raw_pids, list):
-            _report_issue(on_issue, "item", "participant_ids is not a list")
+            _report_issue(on_issue, "item", "participant_ids is not a list",
+                          record, kept=True)
             raw_pids = []
         seen = set()
         pids = []
@@ -115,10 +179,11 @@ class Item:
             try:
                 s = _normalize_id(p, "participant")
             except Exception as e:
-                _report_issue(on_issue, "participant", e)
+                _report_issue(on_issue, "participant", e, in_item)
                 continue
             if s in seen:
-                _report_issue(on_issue, "participant", "duplicate id '%s'" % s)
+                _report_issue(on_issue, "participant", "duplicate id '%s'" % s,
+                              in_item)
                 continue
             seen.add(s)
             pids.append(s)
@@ -129,32 +194,115 @@ class Item:
         # are wrong. Clamp here instead.
         split = d.get("split", {})
         if not isinstance(split, dict):
-            _report_issue(on_issue, "item", "split is not an object")
+            _report_issue(on_issue, "item",
+                          "split is not an object; using an equal split",
+                          record, kept=True)
             split = {"mode": MODE_EQUAL}
         if split.get("mode") not in (MODE_EQUAL, MODE_UNEVEN):
-            _report_issue(on_issue, "item", "unknown split mode")
+            _report_issue(on_issue, "item",
+                          "unknown split mode; using an equal split",
+                          record, kept=True)
             split = {"mode": MODE_EQUAL}
+        # Keep only what split_item() reads, as values that survive a save
+        # and reload: one non-finite number would make the saved JSON
+        # unparseable and lose the whole bill. split_item() already treats
+        # a non-finite weight as 0, so dropping one leaves the split as is.
+        # It reads only participants' weights, and the UI writes no others;
+        # extra keys would be parsed again on every load, and building a
+        # big dict is superlinear under MicroPython (40,000 keys made each
+        # page load take ~12 s), so drop them with a single issue.
+        # split_item() caps weights at MAX_WEIGHT; cap them here too, so the
+        # UI shows the weight the split uses, and below at -MAX_WEIGHT: a
+        # weight near -1.8e308 (still 0 to split_item()) is written by
+        # MicroPython's 16-digit json.dumps past the largest float, and the
+        # next load reads -inf. The previous release saved typed weights
+        # above the cap, so a saved bill is not malformed for holding one:
+        # the cap is an issue (one per item) only when report_caps asks, as
+        # import does.
+        clean = {"mode": split["mode"]}
+        if split["mode"] == MODE_UNEVEN and "weights" in split:
+            weights = split["weights"]
+            if not isinstance(weights, dict):
+                _report_issue(on_issue, "item",
+                              "weights is not an object; dropped it",
+                              record, kept=True)
+                weights = {}
+            clean["weights"] = {}
+            extra = 0
+            capped = 0
+            for pid, weight in weights.items():
+                if pid not in seen:
+                    extra += 1
+                elif _valid_weight(weight):
+                    if weight > MAX_WEIGHT:
+                        capped += 1
+                        weight = MAX_WEIGHT
+                    elif weight < -MAX_WEIGHT:
+                        capped += 1
+                        weight = -MAX_WEIGHT
+                    clean["weights"][pid] = weight
+                else:
+                    _report_issue(on_issue, "item",
+                                  "dropped invalid weight for '%s'" % pid,
+                                  record, kept=True)
+            if extra:
+                noun = "weight" if extra == 1 else "weights"
+                _report_issue(on_issue, "item",
+                              "dropped %d %s for non-participants"
+                              % (extra, noun), record, kept=True)
+            if capped and report_caps:
+                _report_issue(on_issue, "item",
+                              "%d %s outside +/-MAX_WEIGHT; set to the "
+                              "nearest limit"
+                              % (capped, "weight is" if capped == 1
+                                 else "weights are"), record, kept=True)
+        if len(clean) != len(split):
+            _report_issue(on_issue, "item", "dropped unknown split fields",
+                          record, kept=True)
+        split = clean
 
-        amount = d.get("amount_cents", 0)
+        # A missing amount is zeroed like a malformed one, and reported: a
+        # silent $0.00 would let a backup import look clean.
+        if "amount_cents" not in d:
+            _report_issue(on_issue, "item",
+                          "amount_cents is missing; set to 0",
+                          record, kept=True)
+            amount = 0
+        else:
+            amount = d["amount_cents"]
         # bool is an int subclass; exclude it. Reject non-int (e.g. strings
         # from hand-edited storage) so downstream cent math can't crash.
         if isinstance(amount, bool) or not isinstance(amount, int):
-            _report_issue(on_issue, "item", "amount_cents is not an integer")
+            _report_issue(on_issue, "item",
+                          "amount_cents is not an integer; set to 0",
+                          record, kept=True)
             amount = 0
         # Clamp to [0, MAX_CENTS]. Negatives leak a cent in the uneven
         # path (int() truncates toward zero); oversized values break the
         # float split math. The UI enforces this range; this guards
         # hand-edited / corrupt storage.
         if amount < 0:
-            _report_issue(on_issue, "item", "amount_cents is negative")
+            _report_issue(on_issue, "item",
+                          "amount_cents is negative; set to 0",
+                          record, kept=True)
             amount = 0
         elif amount > MAX_CENTS:
-            _report_issue(on_issue, "item", "amount_cents exceeds MAX_CENTS")
+            _report_issue(on_issue, "item",
+                          "amount_cents exceeds MAX_CENTS; set to MAX_CENTS",
+                          record, kept=True)
             amount = MAX_CENTS
+
+        # Keep the item (and its money) when only the description is bad.
+        try:
+            description = _text(d.get("description", ""), "description")
+        except ValueError as e:
+            _report_issue(on_issue, "item", "%s; left blank" % e, record,
+                          kept=True)
+            description = ""
 
         return Item(
             _normalize_id(d.get("id", ""), "item"),
-            str(d.get("description", "")),
+            description,
             amount,
             _normalize_id(d.get("payer_id", ""), "payer"),
             pids,
@@ -188,7 +336,8 @@ class AppState:
         }
 
     @staticmethod
-    def from_dict(d, on_issue=None):
+    def from_dict(d, on_issue=None, report_caps=False):
+        # report_caps: see Item.from_dict().
         if not isinstance(d, dict):
             _report_issue(on_issue, "state", "top-level value is not an object")
             return AppState()
@@ -202,14 +351,15 @@ class AppState:
             raw_people = []
         person_ids = set()
         for p in raw_people:
+            record = _label(p, "name")
             try:
                 person = Person.from_dict(p)
             except Exception as e:
-                _report_issue(on_issue, "person", e)
+                _report_issue(on_issue, "person", e, record)
                 continue
             if person.id in person_ids:
-                _report_issue(
-                    on_issue, "person", "duplicate id '%s'" % person.id)
+                _report_issue(on_issue, "person",
+                              "duplicate id '%s'" % person.id, record)
                 continue
             person_ids.add(person.id)
             people.append(person)
@@ -222,10 +372,12 @@ class AppState:
             raw_items = []
         item_ids = set()
         for i in raw_items:
+            record = _label(i, "description")
             try:
-                it = Item.from_dict(i, on_issue=on_issue)
+                it = Item.from_dict(i, on_issue=on_issue,
+                                    report_caps=report_caps)
             except Exception as e:
-                _report_issue(on_issue, "item", e)
+                _report_issue(on_issue, "item", e, record)
                 continue
             # Drop items that reference unknown people. Without this,
             # per_person_totals counts unknown ids but settle_up only
@@ -234,18 +386,16 @@ class AppState:
             if it.payer_id not in valid_pids:
                 _report_issue(
                     on_issue, "item",
-                    "payer '%s' not in roster" % it.payer_id)
+                    "payer '%s' not in roster" % it.payer_id, record)
                 continue
             kept = [pid for pid in it.participant_ids if pid in valid_pids]
             if not kept:
-                _report_issue(on_issue, "item", "no known participants")
+                _report_issue(on_issue, "item", "no known participants",
+                              record)
                 continue
             if len(kept) != len(it.participant_ids):
-                _report_issue(
-                    on_issue,
-                    "item",
-                    "dropped unknown participants from '%s'" % it.description,
-                )
+                _report_issue(on_issue, "item", "dropped unknown participants",
+                              record, kept=True)
                 it.participant_ids = kept
                 if it.split.get("mode") == MODE_UNEVEN:
                     weights = it.split.get("weights", {})
@@ -260,7 +410,7 @@ class AppState:
                         }
             if it.id in item_ids:
                 _report_issue(
-                    on_issue, "item", "duplicate id '%s'" % it.id)
+                    on_issue, "item", "duplicate id '%s'" % it.id, record)
                 continue
             item_ids.add(it.id)
             items.append(it)

@@ -3,6 +3,8 @@
     python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -22,6 +24,7 @@ from splitcore.calc import (
 from splitcore.model import (
     MAX_CENTS,
     MAX_ID_LENGTH,
+    MAX_WEIGHT,
     MODE_EQUAL,
     MODE_UNEVEN,
     AppState,
@@ -319,6 +322,117 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(AppState.from_dict("garbage").to_dict(),
                          {"people": [], "items": []})
 
+    def test_missing_amount_is_reported_not_silently_zeroed(self):
+        # A hand-edited backup saying "amount" must not import as a clean
+        # $0.00 item: the import prompt only warns when issues are reported.
+        issues = []
+        state = AppState.from_dict(
+            {"people": [{"id": "a", "name": "A"}],
+             "items": [{"id": "i", "description": "Rent", "amount": 120000,
+                        "payer_id": "a", "participant_ids": ["a"],
+                        "split": {"mode": "equal"}}]},
+            on_issue=lambda kind, message: issues.append((kind, message)))
+
+        self.assertEqual(state.items[0].amount_cents, 0)
+        self.assertEqual(issues,
+                         [("item", "amount_cents is missing; set to 0")])
+
+    def test_console_lines_say_whether_a_record_was_fixed_or_skipped(self):
+        # Import points users to the browser console for details, so each
+        # line must name its record and tell a record kept with a change
+        # ("fixed") from one left out of the bill ("skipped").
+        raw = {
+            "people": [{"id": "a", "name": "Ann"}, {"id": "b", "name": "Bob"},
+                       {"id": "a", "name": "Again"}],
+            "items": [
+                {"id": "i1", "description": "Rent", "payer_id": "a",
+                 "participant_ids": ["a"], "split": {"mode": "equal"}},
+                {"id": "i2", "description": "Car",
+                 "amount_cents": MAX_CENTS + 1, "payer_id": "a",
+                 "participant_ids": ["a"], "split": {"mode": "equal"}},
+                {"id": "i3", "description": "Hotel", "amount_cents": 500,
+                 "payer_id": "a", "participant_ids": ["a", "b", "a"],
+                 "split": {"mode": "uneven",
+                           "weights": {"a": "2", "b": 1, "q": 5}}},
+                {"id": "i4", "description": "Taxi", "amount_cents": 300,
+                 "payer_id": "a", "participant_ids": ["a", "zz"],
+                 "split": {"mode": "equal"}},
+                {"id": "i5", "description": "Ghost", "amount_cents": 100,
+                 "payer_id": "zz", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+            ],
+        }
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            state = AppState.from_dict(raw)
+
+        self.assertEqual([it.id for it in state.items],
+                         ["i1", "i2", "i3", "i4"])
+        self.assertEqual(err.getvalue().splitlines(), [
+            "bunnysplit: skipped malformed person record 'a' (Again): "
+            "duplicate id 'a'",
+            "bunnysplit: fixed item record 'i1' (Rent): "
+            "amount_cents is missing; set to 0",
+            "bunnysplit: fixed item record 'i2' (Car): "
+            "amount_cents exceeds MAX_CENTS; set to MAX_CENTS",
+            "bunnysplit: skipped malformed participant record in item 'i3' "
+            "(Hotel): duplicate id 'a'",
+            "bunnysplit: fixed item record 'i3' (Hotel): "
+            "dropped invalid weight for 'a'",
+            "bunnysplit: fixed item record 'i3' (Hotel): "
+            "dropped 1 weight for non-participants",
+            "bunnysplit: fixed item record 'i4' (Taxi): "
+            "dropped unknown participants",
+            "bunnysplit: skipped malformed item record 'i5' (Ghost): "
+            "payer 'zz' not in roster",
+        ])
+
+
+class TextFieldTests(unittest.TestCase):
+    """Names and descriptions come from untrusted JSON. str() of a deeply
+    nested list recurses in C; under MicroPython on wasm that overflows the
+    JS stack (a RangeError no Python except clause catches) before any
+    length cap is checked, so containers must never reach str()."""
+
+    def _from_dict(self, raw):
+        issues = []
+        state = AppState.from_dict(
+            raw, on_issue=lambda kind, message: issues.append((kind, message)))
+        return state, issues
+
+    def test_container_names_skip_the_person(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": [1, 2]},
+                       {"id": "b", "name": {"x": 1}},
+                       {"id": "c", "name": "C"}],
+            "items": []})
+
+        self.assertEqual([p.name for p in state.people], ["C"])
+        self.assertEqual(len(issues), 2)
+
+    def test_container_description_is_blanked_and_the_item_kept(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": "A"}],
+            "items": [{"id": "i", "description": [["x"]], "amount_cents": 500,
+                       "payer_id": "a", "participant_ids": ["a"],
+                       "split": {"mode": "equal"}}]})
+
+        self.assertEqual(state.items[0].description, "")
+        self.assertEqual(state.items[0].amount_cents, 500)
+        self.assertEqual(len(issues), 1)
+
+    def test_scalar_names_and_descriptions_are_still_coerced(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": 42}],
+            "items": [{"id": "i", "description": 7, "amount_cents": 500,
+                       "payer_id": "a", "participant_ids": ["a"],
+                       "split": {"mode": "equal"}}]})
+
+        self.assertEqual(state.people[0].name, "42")
+        self.assertEqual(state.items[0].description, "7")
+        self.assertEqual(issues, [])
+
 
 class FromDictBoundaryTests(unittest.TestCase):
     """Persisted state arrives from localStorage and may be hand-edited
@@ -416,6 +530,40 @@ class FromDictBoundaryTests(unittest.TestCase):
         state = AppState.from_dict(raw)
         self.assertEqual([person.id for person in state.people], ["a"])
         self.assertEqual(state.items[0].participant_ids, ["a"])
+
+    def test_ids_with_a_nul_character_are_skipped_and_reported(self):
+        # MicroPython's jsffi cuts a str at its first NUL when it reaches JS,
+        # so the DOM would hold "b" for a person whose id is "b\x00": adding
+        # an item would then record a participant or payer nobody has, or
+        # another person's id, and lose that share.
+        issues = []
+        raw = {
+            "people": [
+                {"id": "a", "name": "A"},
+                {"id": "b\x00", "name": "B"},
+                {"id": "a\x00b", "name": "Also B"},
+            ],
+            "items": [
+                {"id": "i1", "description": "kept", "amount_cents": 100,
+                 "payer_id": "a", "participant_ids": ["a", "b\x00"],
+                 "split": {"mode": "equal"}},
+                {"id": "i2", "description": "bad payer", "amount_cents": 100,
+                 "payer_id": "a\x00", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+                {"id": "i3\x00", "description": "bad id", "amount_cents": 100,
+                 "payer_id": "a", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+            ],
+        }
+
+        state = AppState.from_dict(
+            raw, on_issue=lambda kind, message: issues.append((kind, message)))
+
+        self.assertEqual([p.id for p in state.people], ["a"])
+        self.assertEqual([it.id for it in state.items], ["i1"])
+        self.assertEqual(state.items[0].participant_ids, ["a"])
+        self.assertEqual(
+            sum("NUL" in message for _, message in issues), 5, issues)
 
     def test_unknown_split_mode_normalized_to_equal(self):
         raw = {
@@ -527,6 +675,157 @@ class HugeWeightTests(unittest.TestCase):
         shares = split_item(item(1000, ["a", "b"],
                                  split=uneven({"a": 1e308, "b": 1})))
         self.assertEqual(sum(shares.values()), 1000)
+
+
+class SplitSanitizingTests(unittest.TestCase):
+    """Item.from_dict keeps only split data that survives a JSON round trip,
+    and only finite numbers as weights.
+
+    json.loads turns 1e309 into inf, and dumps() writes that back as a bare
+    inf/Infinity that json.loads rejects, so the next load would drop the
+    whole bill. split_item() already treats a non-finite weight as 0, so
+    dropping one does not change the computed split."""
+
+    def _state(self, split, ids="ab", **kwargs):
+        issues = []
+        state = AppState.from_dict(
+            {"people": [{"id": pid, "name": pid.upper()} for pid in ids],
+             "items": [{"id": "i", "description": "x", "amount_cents": 1000,
+                        "payer_id": "a", "participant_ids": list(ids),
+                        "split": split}]},
+            on_issue=lambda kind, message: issues.append((kind, message)),
+            **kwargs)
+        return state, issues
+
+    def assert_strict_json(self, state):
+        json.dumps(state.to_dict(), allow_nan=False)
+
+    def test_overflowing_weight_is_dropped_and_split_is_unchanged(self):
+        split = json.loads('{"mode": "uneven", "weights": {"a": 1e309, "b": 2}}')
+        before = split_item(item(1000, ["a", "b"], split=dict(split)))
+
+        state, issues = self._state(split)
+
+        self.assertEqual(state.items[0].split,
+                         {"mode": MODE_UNEVEN, "weights": {"b": 2}})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(len(issues), 1)
+        self.assert_strict_json(state)
+
+    def test_nan_and_negative_infinity_weights_are_dropped(self):
+        state, issues = self._state(uneven({"a": float("nan"),
+                                            "b": float("-inf")}))
+
+        self.assertEqual(state.items[0].weights(), {})
+        self.assertEqual(len(issues), 2)
+        self.assert_strict_json(state)
+
+    def test_container_weights_are_dropped(self):
+        # A container could hide a non-finite number anywhere inside it.
+        state, issues = self._state(uneven({"a": [1e309], "b": {"x": 1}}))
+
+        self.assertEqual(state.items[0].weights(), {})
+        self.assertEqual(len(issues), 2)
+        self.assert_strict_json(state)
+
+    def test_only_finite_numbers_are_kept_as_weights(self):
+        # The app only ever saves float weights. A string weight would reach
+        # the UI's weight formatting, and MicroPython's int() of a long digit
+        # string is quadratic, so it would freeze every render.
+        weights = {"a": 1, "b": "2", "c": 0.5, "d": True, "e": None,
+                   "f": "7" * 1000}
+
+        state, issues = self._state(uneven(dict(weights)), ids="abcdef")
+
+        self.assertEqual(state.items[0].weights(), {"a": 1, "c": 0.5})
+        self.assertEqual(len(issues), 4)
+        self.assert_strict_json(state)
+
+    def test_weights_above_the_cap_are_capped_silently(self):
+        # split_item() caps weights at MAX_WEIGHT anyway, so capping them here
+        # leaves the split as is. Kept verbatim, 20,000 weights of 1e308 fit
+        # every backup limit and made each render take ~10 s under
+        # MicroPython. The previous release saved typed weights above the
+        # cap, so a saved bill holding one is not malformed: no issue, no
+        # console line.
+        weights = {"a": 1e308, "b": 10 ** 40, "c": MAX_WEIGHT, "d": 1}
+        before = split_item(item(1000, list("abcd"), split=uneven(dict(weights))))
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            state, issues = self._state(uneven(dict(weights)), ids="abcd")
+
+        self.assertEqual(state.items[0].weights(),
+                         {"a": MAX_WEIGHT, "b": MAX_WEIGHT, "c": MAX_WEIGHT,
+                          "d": 1})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(issues, [])
+        self.assertEqual(err.getvalue(), "")
+        self.assert_strict_json(state)
+
+    def test_weights_below_minus_the_cap_are_capped(self):
+        # MicroPython's json.dumps writes 16 significant digits, so
+        # -1.7976931348623157e308 saves as -1.797693134862316e+308, past
+        # the largest float: the next load reads -inf and drops it. Ordinary
+        # negatives are kept; split_item() treats every one as 0.
+        split = json.loads('{"mode": "uneven", "weights": '
+                           '{"a": -1.7976931348623157e308, "b": -5, "c": 1}}')
+        before = split_item(item(1000, list("abc"), split=dict(split)))
+
+        state, issues = self._state(split, ids="abc")
+
+        weights = state.items[0].weights()
+        self.assertEqual(weights, {"a": -MAX_WEIGHT, "b": -5, "c": 1})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(issues, [])
+        for weight in weights.values():  # as MicroPython's dumps writes it
+            self.assertTrue(is_finite_number(float("%.16g" % weight)))
+
+    def test_capped_weights_are_one_issue_per_item_when_reported(self):
+        # Backup import asks for the report, so the importer learns the
+        # file was changed.
+        state, issues = self._state(
+            uneven({"a": 1e308, "b": -1e308, "c": MAX_WEIGHT, "d": -5}),
+            ids="abcd", report_caps=True)
+
+        self.assertEqual(state.items[0].weights(),
+                         {"a": MAX_WEIGHT, "b": -MAX_WEIGHT, "c": MAX_WEIGHT,
+                          "d": -5})
+        self.assertEqual(
+            issues,
+            [("item", "2 weights are outside +/-MAX_WEIGHT; "
+                      "set to the nearest limit")])
+
+    def test_weights_for_non_participants_are_dropped_with_one_issue(self):
+        # split_item() reads only participants' weights, and the app writes
+        # no others. Under MicroPython, building one dict is superlinear in
+        # its key count: 40,000 extra keys fit a 380 KiB backup and made
+        # every later page load take ~12 s. Reporting each key would also
+        # flood the console, so the extra keys are one issue per item.
+        weights = {"a": 1, "b": 2, "x": 1, "y": None, "z": "7"}
+        before = split_item(item(1000, ["a", "b"], split=uneven(dict(weights))))
+
+        state, issues = self._state(uneven(dict(weights)))
+
+        self.assertEqual(state.items[0].weights(), {"a": 1, "b": 2})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(issues,
+                         [("item", "dropped 3 weights for non-participants")])
+        self.assert_strict_json(state)
+
+    def test_unknown_split_fields_are_dropped(self):
+        for split, expected in (
+            ({"mode": "equal", "junk": [float("inf")], "weights": {"a": 1}},
+             {"mode": MODE_EQUAL}),
+            ({"mode": "uneven", "weights": {"a": 1}, "extra": float("inf")},
+             {"mode": MODE_UNEVEN, "weights": {"a": 1}}),
+        ):
+            with self.subTest(split=split):
+                state, issues = self._state(split)
+
+                self.assertEqual(state.items[0].split, expected)
+                self.assertEqual(len(issues), 1)
+                self.assert_strict_json(state)
 
 
 if __name__ == "__main__":
