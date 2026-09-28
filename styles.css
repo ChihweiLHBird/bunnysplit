@@ -900,6 +900,8 @@ body:has(#mode-uneven:checked) .chip:has(.p-check:checked) .p-weight {
   min-height: 1.1em;
   margin-top: 6px;
 }
+/* The <noscript> message: a class, since the CSP blocks inline styles. */
+.noscript { text-align: center; margin: 2rem; }
 
 /* ================ MOBILE TWEAKS ================ */
 @media (max-width: 760px) {

@@ -3,6 +3,24 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Content-Security-Policy, first so it covers every load below. It lists
+       exactly what the app loads: the pinned PyScript release and the
+       MicroPython build it imports from jsDelivr (bump both paths with
+       PyScript; tests/test_csp.py fails until you do), Google Fonts, and
+       this origin for the .py files, styles, icons, manifest and sw.js.
+       WebAssembly needs 'wasm-unsafe-eval'; nothing needs inline code or
+       eval. A <meta> policy can't carry frame-ancestors or reporting. -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'none';
+    script-src https://pyscript.net/releases/2024.11.1/ https://cdn.jsdelivr.net/npm/@micropython/micropython-webassembly-pyscript@1.24.0/ 'wasm-unsafe-eval';
+    connect-src 'self' https://cdn.jsdelivr.net/npm/@micropython/micropython-webassembly-pyscript@1.24.0/;
+    style-src 'self' https://pyscript.net/releases/2024.11.1/ https://fonts.googleapis.com;
+    font-src https://fonts.gstatic.com;
+    img-src 'self' data:;
+    worker-src 'self';
+    manifest-src 'self';
+    base-uri 'none';
+    form-action 'none'">
   <meta name="theme-color" content="#635bff">
   <meta name="description" content="Split bills fairly. Add people, log items, settle up — all local.">
   <title>bunnysplit — Workspace</title>
@@ -17,22 +35,7 @@
   <meta name="apple-mobile-web-app-title" content="bunnysplit">
   <meta name="application-name" content="bunnysplit">
 
-  <!-- Defense-in-depth CSP. DISABLED by default: PyScript needs WebAssembly
-       ('wasm-unsafe-eval') plus the exact CDN hosts it fetches the runtime
-       from, so a wrong policy silently prevents the app from booting.
-       Before enabling: load the app with DevTools > Network/Console open,
-       confirm every request's host is allow-listed below, then uncomment.
-  <meta http-equiv="Content-Security-Policy" content="
-    default-src 'none';
-    script-src https://pyscript.net 'wasm-unsafe-eval';
-    style-src https://pyscript.net https://fonts.googleapis.com 'unsafe-inline';
-    font-src https://fonts.gstatic.com;
-    img-src 'self' data:;
-    connect-src https://pyscript.net;
-    base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
-  -->
-
-  <!-- Pinned PyScript release. Bump in both URLs to upgrade. -->
+  <!-- Pinned PyScript release. Bump in both URLs, and in the CSP above. -->
   <link rel="stylesheet" href="https://pyscript.net/releases/2024.11.1/core.css">
   <script type="module" src="https://pyscript.net/releases/2024.11.1/core.js"></script>
 
@@ -44,7 +47,7 @@
 </head>
 <body>
   <noscript>
-    <p class="error" style="text-align:center;margin:2rem">
+    <p class="error noscript">
       bunnysplit needs JavaScript enabled to run.
     </p>
   </noscript>
