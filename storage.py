@@ -121,9 +121,16 @@ MAX_BACKUP_BYTES = 512 * 1024
 MAX_NUMBER_DIGITS = MAX_ID_LENGTH
 # Spelled out on purpose: MicroPython's re accepts "{n}" but never matches it.
 _LONG_NUMBER = re.compile("[0-9]" * (MAX_NUMBER_DIGITS + 1))
+_HEX = "[0-9a-fA-F]"
+_UNICODE_ESCAPE = re.compile("\\\\u" + _HEX * 4)
+# Escaped UTF-16 surrogates: a high+low pair, and any half left over.
+_SURROGATE_PAIR = re.compile(
+    "\\\\u[dD][89abAB]" + _HEX * 2 + "\\\\u[dD][c-fC-F]" + _HEX * 2)
+_SURROGATE = re.compile("\\\\u[dD][89a-fA-F]" + _HEX * 2)
 
 
 def check_backup_size(size):
+    # UTF-8 bytes: File.size before reading, the decoded text after.
     # Negative means a multi-GiB File.size wrapped: MicroPython's jsffi
     # truncates JS numbers to int32.
     if size < 0 or size > MAX_BACKUP_BYTES:
@@ -161,15 +168,56 @@ def check_restorable(state):
     return text
 
 
+def _has_bad_unicode_escape(text):
+    # MicroPython's json.loads reads the four characters after \u as hex
+    # whatever they are, even a '"', which would hide a string delimiter
+    # from _has_long_number(). Standard JSON requires four hex digits.
+    # Without escaped backslashes, every remaining backslash starts an escape.
+    bare = text.replace("\\\\", "")
+    return "\\u" in bare and "\\u" in _UNICODE_ESCAPE.sub("", bare)
+
+
 def _has_long_number(text):
     # MicroPython converts a huge integer literal in quadratic time (150k
     # digits took 1.5 s), so long digit runs must be refused before json.loads.
     # Only digits outside strings become numbers. Dropping escaped backslashes,
-    # then escaped quotes, leaves every remaining '"' as a string delimiter, so
-    # the even-indexed pieces of a split lie outside strings. These are C-level
-    # string ops; a per-character Python loop is ~20x slower here.
+    # then escaped quotes, leaves every remaining '"' as a string delimiter
+    # (given _has_bad_unicode_escape() passed), so the even-indexed pieces of
+    # a split lie outside strings. These are C-level string ops; a
+    # per-character Python loop is ~20x slower here.
     bare = text.replace("\\\\", "").replace('\\"', "")
     return _LONG_NUMBER.search(" ".join(bare.split('"')[::2])) is not None
+
+
+def _surrogate_pair(match):
+    s = match.group(0)
+    return chr(0x10000 + ((int(s[2:6], 16) - 0xD800) << 10)
+               + int(s[8:12], 16) - 0xDC00)
+
+
+def _decode_surrogate_escapes(text):
+    """Return (text, whether an unpaired surrogate escape was replaced).
+
+    MicroPython's json.loads decodes each half of an escaped surrogate pair
+    (CPython's json.dumps writes emoji that way by default) on its own, into
+    an invalid lone surrogate that the browser shows and saves as U+FFFD
+    garbage. So decode pairs to the real character, and unpaired halves to
+    U+FFFD, before parsing. Splitting on escaped backslashes keeps a literal
+    backslash followed by "ud83d" as it is. The replacements are raw
+    characters: MicroPython's re.sub processes backslashes even in what a
+    replacement function returns.
+    """
+    if "\\ud" not in text and "\\uD" not in text:
+        return text, False
+    parts = text.split("\\\\")
+    lone = False
+    for k in range(len(parts)):
+        part = _SURROGATE_PAIR.sub(_surrogate_pair, parts[k])
+        if _SURROGATE.search(part) is not None:
+            part = _SURROGATE.sub("\ufffd", part)
+            lone = True
+        parts[k] = part
+    return "\\\\".join(parts), lone
 
 
 def _check_backup_counts(raw):
@@ -197,10 +245,15 @@ def parse_backup(text):
     list, so shape is checked here first; otherwise an unrelated JSON object
     would silently import as an empty bill.
     """
-    check_backup_size(len(text))
+    # Encoded, because Blob.text() turns each invalid byte of the file into a
+    # three-byte U+FFFD.
+    check_backup_size(len(text.encode()))
+    if _has_bad_unicode_escape(text):
+        raise ValueError("That file isn't valid JSON.")
     if _has_long_number(text):
         raise ValueError(
             "That file has a number too long to be a bunnysplit backup.")
+    text, lone_surrogates = _decode_surrogate_escapes(text)
     try:
         raw = json.loads(text)
     except Exception:
@@ -213,10 +266,14 @@ def parse_backup(text):
             "(expected \"people\" and \"items\" lists).")
     _check_backup_counts(raw)
     issues = []
+    if lone_surrogates:
+        issue = "text: replaced unpaired surrogate escapes with U+FFFD"
+        window.console.warn("bunnysplit: " + issue)
+        issues.append(issue)
     state = AppState.from_dict(
         raw, on_issue=lambda kind, message: issues.append(kind + ": " + message))
     # Text lengths and the re-export size can only be judged after from_dict()
-    # (it str()s non-string names, and quotes integer ids).
+    # (it str()s scalar names, and quotes integer ids).
     check_restorable(state)
     return state, issues
 

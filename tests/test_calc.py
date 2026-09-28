@@ -319,6 +319,65 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(AppState.from_dict("garbage").to_dict(),
                          {"people": [], "items": []})
 
+    def test_missing_amount_is_reported_not_silently_zeroed(self):
+        # A hand-edited backup saying "amount" must not import as a clean
+        # $0.00 item: the import prompt only warns when issues are reported.
+        issues = []
+        state = AppState.from_dict(
+            {"people": [{"id": "a", "name": "A"}],
+             "items": [{"id": "i", "description": "Rent", "amount": 120000,
+                        "payer_id": "a", "participant_ids": ["a"],
+                        "split": {"mode": "equal"}}]},
+            on_issue=lambda kind, message: issues.append((kind, message)))
+
+        self.assertEqual(state.items[0].amount_cents, 0)
+        self.assertEqual(issues, [("item", "amount_cents is missing")])
+
+
+class TextFieldTests(unittest.TestCase):
+    """Names and descriptions come from untrusted JSON. str() of a deeply
+    nested list recurses in C; under MicroPython on wasm that overflows the
+    JS stack (a RangeError no Python except clause catches) before any
+    length cap is checked, so containers must never reach str()."""
+
+    def _from_dict(self, raw):
+        issues = []
+        state = AppState.from_dict(
+            raw, on_issue=lambda kind, message: issues.append((kind, message)))
+        return state, issues
+
+    def test_container_names_skip_the_person(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": [1, 2]},
+                       {"id": "b", "name": {"x": 1}},
+                       {"id": "c", "name": "C"}],
+            "items": []})
+
+        self.assertEqual([p.name for p in state.people], ["C"])
+        self.assertEqual(len(issues), 2)
+
+    def test_container_description_is_blanked_and_the_item_kept(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": "A"}],
+            "items": [{"id": "i", "description": [["x"]], "amount_cents": 500,
+                       "payer_id": "a", "participant_ids": ["a"],
+                       "split": {"mode": "equal"}}]})
+
+        self.assertEqual(state.items[0].description, "")
+        self.assertEqual(state.items[0].amount_cents, 500)
+        self.assertEqual(len(issues), 1)
+
+    def test_scalar_names_and_descriptions_are_still_coerced(self):
+        state, issues = self._from_dict({
+            "people": [{"id": "a", "name": 42}],
+            "items": [{"id": "i", "description": 7, "amount_cents": 500,
+                       "payer_id": "a", "participant_ids": ["a"],
+                       "split": {"mode": "equal"}}]})
+
+        self.assertEqual(state.people[0].name, "42")
+        self.assertEqual(state.items[0].description, "7")
+        self.assertEqual(issues, [])
+
 
 class FromDictBoundaryTests(unittest.TestCase):
     """Persisted state arrives from localStorage and may be hand-edited
@@ -530,12 +589,13 @@ class HugeWeightTests(unittest.TestCase):
 
 
 class SplitSanitizingTests(unittest.TestCase):
-    """Item.from_dict keeps only split data that survives a JSON round trip.
+    """Item.from_dict keeps only split data that survives a JSON round trip,
+    and only finite numbers as weights.
 
     json.loads turns 1e309 into inf, and dumps() writes that back as a bare
     inf/Infinity that json.loads rejects, so the next load would drop the
-    whole bill. split_item() already treats each dropped value as weight 0,
-    so the computed split does not change."""
+    whole bill. split_item() already treats a non-finite weight as 0, so
+    dropping one does not change the computed split."""
 
     def _state(self, split):
         issues = []
@@ -578,13 +638,18 @@ class SplitSanitizingTests(unittest.TestCase):
         self.assertEqual(len(issues), 2)
         self.assert_strict_json(state)
 
-    def test_json_safe_weights_are_kept_as_is(self):
-        weights = {"a": 1, "b": "2", "c": 0.5, "d": True, "e": None}
+    def test_only_finite_numbers_are_kept_as_weights(self):
+        # The app only ever saves float weights. A string weight would reach
+        # the UI's weight formatting, and MicroPython's int() of a long digit
+        # string is quadratic, so it would freeze every render.
+        weights = {"a": 1, "b": "2", "c": 0.5, "d": True, "e": None,
+                   "f": "7" * 1000}
 
         state, issues = self._state(uneven(dict(weights)))
 
-        self.assertEqual(state.items[0].weights(), weights)
-        self.assertEqual(issues, [])
+        self.assertEqual(state.items[0].weights(), {"a": 1, "c": 0.5})
+        self.assertEqual(len(issues), 4)
+        self.assert_strict_json(state)
 
     def test_unknown_split_fields_are_dropped(self):
         for split, expected in (

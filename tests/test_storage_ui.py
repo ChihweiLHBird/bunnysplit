@@ -34,8 +34,8 @@ class FakeConsole:
     def __init__(self):
         self.warnings = []
 
-    def warn(self, message):
-        self.warnings.append(message)
+    def warn(self, *parts):
+        self.warnings.append(" ".join(str(part) for part in parts))
 
     def log(self, message):
         pass
@@ -210,6 +210,108 @@ class BackupFormatTests(unittest.TestCase):
             self.storage.parse_backup(text)
 
         self.assertIn("number too long", str(ctx.exception))
+
+    def test_malformed_unicode_escape_is_rejected_before_parsing(self):
+        # MicroPython's json.loads reads the four characters after \u as hex
+        # whatever they are, even a '"', so to it "\u"abc" is one string and
+        # the digits below are an unquoted number the digit scan would miss.
+        text = ('{"people": [], "items": [], "x": "\\u"abc", "y": '
+                + "7" * 100 + "}")
+
+        with mock.patch.object(self.storage.json, "loads") as loads:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(text)
+
+        loads.assert_not_called()
+        self.assertEqual(str(ctx.exception), "That file isn't valid JSON.")
+
+    def test_standard_escapes_still_import(self):
+        # A control character, a quote, a literal backslash-u and an accent,
+        # written both escaped and raw.
+        name = 'A\u0001"\\u\u00e9'
+        for ensure_ascii in (True, False):
+            with self.subTest(ensure_ascii=ensure_ascii):
+                text = json.dumps(
+                    {"people": [{"id": "p1", "name": name}], "items": []},
+                    ensure_ascii=ensure_ascii)
+
+                state, issues = self.storage.parse_backup(text)
+
+                self.assertEqual(state.people[0].name, name)
+                self.assertEqual(issues, [])
+
+    def test_surrogate_pair_escapes_are_decoded_before_json_loads(self):
+        # MicroPython's json.loads decodes each half of \ud83d\ude00 on its
+        # own into an invalid lone surrogate, which the browser shows and
+        # saves as U+FFFD garbage. CPython's json.dumps writes emoji that
+        # way by default, so pairs must be combined before parsing.
+        text = json.dumps({
+            "people": [{"id": "p1", "name": "Ann \U0001F600"}],
+            "items": [{"id": "i1", "description": "Party \U0001F389",
+                       "amount_cents": 100, "payer_id": "p1",
+                       "participant_ids": ["p1"], "split": {"mode": "equal"}}],
+        }).replace("\\ud83c\\udf89", "\\uD83C\\uDF89")
+        self.assertIn("\\ud83d\\ude00", text)
+        parsed = []
+        real_loads = json.loads
+
+        def loads(s):
+            parsed.append(s)
+            return real_loads(s)
+
+        with mock.patch.object(self.storage.json, "loads", loads):
+            state, issues = self.storage.parse_backup(text)
+
+        self.assertNotIn("\\ud", parsed[0].lower())
+        self.assertEqual(state.people[0].name, "Ann \U0001F600")
+        self.assertEqual(state.items[0].description, "Party \U0001F389")
+        self.assertEqual(issues, [])
+
+    def test_unpaired_surrogate_escapes_become_replacement_characters(self):
+        text = ('{"people": [{"id": "p1", "name": "a\\ud83d b\\ude00'
+                ' c\\ude00\\ud83d"}], "items": []}')
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(state.people[0].name, "a\ufffd b\ufffd c\ufffd\ufffd")
+        self.assertEqual(len(issues), 1)
+
+    def test_escaped_backslash_before_ud_is_left_alone(self):
+        # "\\ud83d" in JSON is a literal backslash followed by "ud83d".
+        name = "\\ud83d\\ude00 \\\U0001F600"
+        text = json.dumps({"people": [{"id": "p1", "name": name}],
+                           "items": []})
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(state.people[0].name, name)
+        self.assertEqual(issues, [])
+
+    def test_size_is_measured_in_utf8_bytes_of_the_decoded_text(self):
+        # Blob.text() decodes each invalid byte of a file to U+FFFD: one
+        # character but three UTF-8 bytes, so a file within the byte limit
+        # could otherwise hand json.loads three times as much text.
+        limit = self.storage.MAX_BACKUP_BYTES
+        text = ('{"people": [], "items": [], "x": "'
+                + "\ufffd" * (limit - 40) + '"}')
+        self.assertLessEqual(len(text), limit)
+
+        with mock.patch.object(self.storage.json, "loads") as loads:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(text)
+
+        loads.assert_not_called()
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_multibyte_text_exactly_at_the_byte_limit_is_accepted(self):
+        head, tail = '{"people": [], "items": [], "x": "', '"}'
+        room = self.storage.MAX_BACKUP_BYTES - len(head) - len(tail)
+        text = head + "\u00e9" * (room // 2) + "x" * (room % 2) + tail
+        self.assertEqual(len(text.encode()), self.storage.MAX_BACKUP_BYTES)
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual(issues, [])
 
     def test_record_counts_are_limited_before_building_state(self):
         people = [{"id": "p%d" % i, "name": "P%d" % i}
@@ -401,20 +503,39 @@ class FakeDocument:
         return FakeElement(tag)
 
 
+class FakeJsError(BaseException):
+    """A JS exception reaching Python through MicroPython's jsffi: it unwinds
+    through Python frames without running `except Exception`."""
+
+
 class FakePromise:
     def __init__(self, value=None, error=None):
         self._value = value
         self._error = error
         self.callbacks = None
+        self.catch_callback = None
+        self.rejection = None
 
     def then(self, on_ok, on_err):
         # Settles synchronously; a browser settles after the change handler
         # returns, so import callbacks must not depend on either ordering.
+        # Anything a handler throws rejects the chained promise; this fake
+        # returns itself as that promise.
         self.callbacks = (on_ok, on_err)
-        if self._error is not None:
-            on_err(self._error)
-        else:
-            on_ok(self._value)
+        try:
+            if self._error is not None:
+                on_err(self._error)
+            else:
+                on_ok(self._value)
+        except BaseException as e:
+            self.rejection = e
+        return self
+
+    def catch(self, on_err):
+        self.catch_callback = on_err
+        if self.rejection is not None:
+            on_err(self.rejection)
+        return self
 
 
 class FakeFile:
@@ -495,6 +616,18 @@ class UiBoundaryTests(unittest.TestCase):
         ui._seed_counter()
 
         self.assertEqual(ui._next_id("p"), "p3")
+
+    def test_weights_are_shown_as_the_split_uses_them(self):
+        # split_item() reads weights through parse_finite(); a long digit
+        # string must never reach int(), which MicroPython runs in
+        # quadratic time on every render.
+        ui = load_ui(FakePill())
+        cases = ((2.0, "2"), (3, "3"), (1.5, "1.5"), (float("inf"), "0"),
+                 (float("nan"), "0"), (-1, "0"), (None, "0"),
+                 ("7" * 400, "0"))
+        for weight, shown in cases:
+            with self.subTest(weight=weight):
+                self.assertEqual(ui._fmt_weight(weight), shown)
 
 
 BACKUP = json.dumps({
@@ -598,7 +731,7 @@ class ImportExportTests(unittest.TestCase):
 
         raw = self.local.values["bunnysplit"]
         json.loads(raw, parse_constant=reject)
-        self.assertIn("skipped or adjusted", self.status.textContent)
+        self.assertIn("fixed or skipped", self.status.textContent)
         reloaded = load_storage(FakeLocalStorage({"bunnysplit": raw}))
         state = reloaded.load()
         self.assertEqual(len(state.items), 1)
@@ -679,10 +812,33 @@ class ImportExportTests(unittest.TestCase):
 
         self.import_text(text)
 
-        self.assertIn("1 record", self.prompts[0])
+        self.assertIn(
+            "\n\n1 problem was fixed or skipped while reading the file.",
+            self.prompts[0])
         self.assertEqual([p.name for p in self.ui._state.people], ["A"])
-        self.assertIn("1 record was skipped or adjusted",
+        self.assertIn("1 problem was fixed or skipped; see the browser console",
                       self.status.textContent)
+
+    def test_the_note_counts_problems_not_records(self):
+        # One item can have several problems; calling each a "record" would
+        # claim more of the file was damaged than it holds.
+        self.ui._state = AppState(people=[Person("old", "Stale")])
+        text = json.dumps({
+            "people": [{"id": "p1", "name": "A"}],
+            "items": [{"id": "i1", "description": "x", "amount_cents": "5",
+                       "payer_id": "p9", "participant_ids": ["p1"],
+                       "split": {"mode": "equal"}}],
+        })
+
+        self.import_text(text)
+
+        self.assertIn(
+            "\n\n2 problems were fixed or skipped while reading the file.",
+            self.prompts[0])
+        self.assertEqual(
+            self.status.textContent,
+            "Imported 1 person and 0 items. 2 problems were fixed or skipped;"
+            " see the browser console for details.")
 
     def test_oversized_file_is_rejected_before_reading(self):
         big = FakeFile(text_value=BACKUP,
@@ -751,10 +907,10 @@ class ImportExportTests(unittest.TestCase):
         self.assertIn("Import failed", self.status.textContent)
         self.assertEqual(self.status.className, "error")
 
-    def test_imports_share_one_long_lived_pair_of_promise_callbacks(self):
+    def test_imports_share_one_long_lived_set_of_promise_callbacks(self):
         # The read promise settles after the change handler returns, so the
         # callbacks can't be render-scoped. Per-import proxies would either
-        # leak or be destroyed while still executing; reuse one pair instead.
+        # leak or be destroyed while still executing; reuse one set instead.
         created = []
         wrap = self.ui.create_proxy
         self.ui.create_proxy = lambda fn: created.append(fn) or wrap(fn)
@@ -768,6 +924,76 @@ class ImportExportTests(unittest.TestCase):
         self.assertEqual(len(created), created_by_first)
         self.assertEqual(first.promises[0].callbacks,
                          second.promises[0].callbacks)
+        self.assertIsNotNone(first.promises[0].catch_callback)
+        self.assertEqual(first.promises[0].catch_callback,
+                         second.promises[0].catch_callback)
+
+    def fail_saves(self, error):
+        def save(state, text=None):
+            raise error
+
+        self.ui._storage.save = save
+
+    def test_a_failed_save_keeps_the_current_bill(self):
+        original = AppState(people=[Person("old", "Keep")])
+        self.ui._state = original
+        renders = []
+        self.ui.render_all = lambda: renders.append(1)
+        self.fail_saves(RuntimeError("QuotaExceededError"))
+
+        self.import_text(BACKUP)
+
+        self.assertIs(self.ui._state, original)
+        self.assertIsNone(self.saved())
+        self.assertEqual(renders, [])
+        self.assertEqual(
+            self.status.textContent,
+            "Could not save the imported bill; your current bill was kept.")
+        self.assertEqual(self.status.className, "error")
+
+    def test_a_save_error_that_skips_python_handlers_keeps_the_bill(self):
+        # Under MicroPython a JS exception from localStorage.setItem unwinds
+        # through Python without running except or finally, so the bill must
+        # not be swapped in before the save returns, and the failure message
+        # must already be showing when it escapes.
+        original = AppState(people=[Person("old", "Keep")])
+        self.ui._state = original
+        self.fail_saves(FakeJsError("QuotaExceededError"))
+
+        with self.assertRaises(FakeJsError):
+            self.ui._import_backup(BACKUP)
+
+        self.assertIs(self.ui._state, original)
+        self.assertEqual(
+            self.status.textContent,
+            "Could not save the imported bill; your current bill was kept.")
+        self.assertEqual(self.status.className, "error")
+
+    def test_the_read_promise_chain_reports_errors_that_escape(self):
+        # A trailing catch on the read promise sees what escaped the text
+        # callback. It keeps a specific message that is already showing...
+        self.ui._state = AppState(people=[Person("old", "Keep")])
+        self.fail_saves(FakeJsError("QuotaExceededError"))
+
+        self.import_text(BACKUP)
+
+        self.assertEqual(
+            self.status.textContent,
+            "Could not save the imported bill; your current bill was kept.")
+        self.assertTrue(any("QuotaExceededError" in w
+                            for w in self.ui.window.console.warnings))
+
+        # ...and otherwise says the import failed.
+        def explode(text):
+            raise FakeJsError("RangeError")
+
+        self.ui._storage.parse_backup = explode
+
+        self.import_text(BACKUP)
+
+        self.assertEqual(self.status.textContent,
+                         "Import failed; see the browser console for details.")
+        self.assertEqual(self.status.className, "error")
 
 
 class BillLimitTests(unittest.TestCase):

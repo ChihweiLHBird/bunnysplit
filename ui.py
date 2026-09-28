@@ -136,12 +136,14 @@ def _paid_by_person():
 
 
 def _fmt_weight(w):
-    try:
-        if w == int(w):
-            return str(int(w))
-        return ("%.2f" % float(w)).rstrip("0").rstrip(".")
-    except (ValueError, TypeError):
+    # Show the weight split_item() uses. Never int() the stored value:
+    # MicroPython's int() of a long digit string is quadratic.
+    f = parse_finite(w)
+    if f is None or f <= 0:
         return "0"
+    if f == int(f):
+        return str(int(f))
+    return ("%.2f" % f).rstrip("0").rstrip(".")
 
 
 def _weights_summary(item):
@@ -684,7 +686,7 @@ def _make_remove_item(iid):
 
 # Proxies for the file-read promise: created on the first import, then
 # reused. The promise settles after on_import_file_change returns, so they
-# can't be render-scoped, and destroying a per-import pair from inside its
+# can't be render-scoped, and destroying a per-import set from inside its
 # own callback would free the proxy that is still executing (see render_all).
 _import_callbacks = None
 
@@ -699,9 +701,10 @@ def _bill_summary(state):
 
 
 def _issues_note(issues):
+    # One record can have several problems, so count problems, not records.
     n = len(issues)
-    return ("1 record was" if n == 1 else "%d records were" % n) + (
-        " skipped or adjusted")
+    return ("1 problem was" if n == 1 else "%d problems were" % n) + (
+        " fixed or skipped")
 
 
 def _set_backup_status(text, error=False):
@@ -757,9 +760,20 @@ def _import_backup(text):
         if not window.confirm(question):
             _set_backup_status("Import cancelled; your current bill was kept.")
             return
+    # Save before swapping the bill in. Under MicroPython a JS exception
+    # (e.g. QuotaExceededError from localStorage.setItem) unwinds through
+    # Python without running except or finally, so show the failure first
+    # and replace it only once the save has returned.
+    _set_backup_status(
+        "Could not save the imported bill; your current bill was kept.",
+        error=True)
+    try:
+        _storage.save(new_state)
+    except Exception as e:
+        window.console.warn(
+            "bunnysplit: could not save the imported bill: " + str(e))
+        return
     _state = new_state
-    _seed_counter()
-    _persist_and_render()
     message = "Imported %s and %s." % (
         _count(len(_state.people), "person", "people"),
         _count(len(_state.items), "item", "items"))
@@ -767,6 +781,9 @@ def _import_backup(text):
         message += " %s; see the browser console for details." % (
             _issues_note(issues))
     _set_backup_status(message)
+    _seed_counter()
+    _set_save_status(True)
+    render_all()
 
 
 def _on_import_text(text):
@@ -784,6 +801,17 @@ def _on_import_read_error(err):
     _set_backup_status("Could not read the selected file.", error=True)
 
 
+def _on_import_failed(err):
+    # Trailing catch of the read promise: an error escaped the handlers
+    # above, which under MicroPython any JS exception does. err is passed
+    # whole because str() of a JS error proxy is just "<JsProxy n>". Keep a
+    # more specific message if one is already showing.
+    window.console.warn("bunnysplit: import failed:", err)
+    if not _qs("#backup-status").textContent:
+        _set_backup_status(
+            "Import failed; see the browser console for details.", error=True)
+
+
 def on_import_file_change(event):
     global _import_callbacks
     _set_backup_status("")
@@ -796,12 +824,15 @@ def on_import_file_change(event):
         _storage.check_backup_size(file.size)
         if _import_callbacks is None:
             _import_callbacks = (create_proxy(_on_import_text),
-                                 create_proxy(_on_import_read_error))
+                                 create_proxy(_on_import_read_error),
+                                 create_proxy(_on_import_failed))
+        on_text, on_read_error, on_failed = _import_callbacks
         # file.size can wrap to a small value for files over 4 GiB (int32
-        # truncation), so also cap the read itself; parse_backup() rejects
-        # anything that reaches the cap.
+        # truncation), so also cap the read itself; parse_backup() refuses
+        # text over the limit.
         limit = _storage.MAX_BACKUP_BYTES + 1
-        file.slice(0, limit).text().then(*_import_callbacks)
+        file.slice(0, limit).text().then(on_text, on_read_error).catch(
+            on_failed)
     except ValueError as e:
         _set_backup_status(str(e), error=True)
     except Exception as e:

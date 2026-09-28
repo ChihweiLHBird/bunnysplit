@@ -46,15 +46,27 @@ def _report_issue(on_issue, kind, exc):
             pass
 
 
-def _json_safe_scalar(value):
-    # What json.dumps writes back as standard JSON. A float from an
-    # overflowing literal (1e309) is inf, which dumps emits as a bare
-    # inf/Infinity that json.loads rejects. MicroPython lacks
-    # math.isfinite, so test NaN by self-inequality and inf by abs().
-    if value is None or isinstance(value, (bool, int, str)):
+def _valid_weight(value):
+    # A finite int or float, the only weights the app saves. A float from an
+    # overflowing literal (1e309) is inf, which json.dumps emits as a bare
+    # inf/Infinity that json.loads rejects. A string would reach the UI's
+    # weight formatting, where MicroPython's int() of a long digit string is
+    # quadratic. MicroPython lacks math.isfinite, so test NaN by
+    # self-inequality and inf by abs().
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
         return True
     return isinstance(value, float) and value == value and (
         abs(value) != float("inf"))
+
+
+def _text(value, kind):
+    # str() of a deeply nested list recurses in C; under MicroPython on wasm
+    # that overflows the JS stack, which no Python except clause catches.
+    if isinstance(value, (list, tuple, dict)):
+        raise ValueError(kind + " is not text")
+    return str(value)
 
 
 def _normalize_id(value, kind):
@@ -78,7 +90,8 @@ class Person:
 
     @staticmethod
     def from_dict(d):
-        return Person(_normalize_id(d["id"], "person"), str(d["name"]))
+        return Person(_normalize_id(d["id"], "person"),
+                      _text(d["name"], "person name"))
 
 
 class Item:
@@ -159,7 +172,7 @@ class Item:
         # Keep only what split_item() reads, as values that survive a save
         # and reload: one non-finite number would make the saved JSON
         # unparseable and lose the whole bill. split_item() already treats
-        # every dropped weight as 0, so the computed split is unchanged.
+        # a non-finite weight as 0, so dropping one leaves the split as is.
         clean = {"mode": split["mode"]}
         if split["mode"] == MODE_UNEVEN and "weights" in split:
             weights = split["weights"]
@@ -168,7 +181,7 @@ class Item:
                 weights = {}
             clean["weights"] = {}
             for pid, weight in weights.items():
-                if _json_safe_scalar(weight):
+                if _valid_weight(weight):
                     clean["weights"][pid] = weight
                 else:
                     _report_issue(on_issue, "item",
@@ -177,7 +190,13 @@ class Item:
             _report_issue(on_issue, "item", "dropped unknown split fields")
         split = clean
 
-        amount = d.get("amount_cents", 0)
+        # A missing amount is zeroed like a malformed one, and reported: a
+        # silent $0.00 would let a backup import look clean.
+        if "amount_cents" not in d:
+            _report_issue(on_issue, "item", "amount_cents is missing")
+            amount = 0
+        else:
+            amount = d["amount_cents"]
         # bool is an int subclass; exclude it. Reject non-int (e.g. strings
         # from hand-edited storage) so downstream cent math can't crash.
         if isinstance(amount, bool) or not isinstance(amount, int):
@@ -194,9 +213,16 @@ class Item:
             _report_issue(on_issue, "item", "amount_cents exceeds MAX_CENTS")
             amount = MAX_CENTS
 
+        # Keep the item (and its money) when only the description is bad.
+        try:
+            description = _text(d.get("description", ""), "description")
+        except ValueError as e:
+            _report_issue(on_issue, "item", e)
+            description = ""
+
         return Item(
             _normalize_id(d.get("id", ""), "item"),
-            str(d.get("description", "")),
+            description,
             amount,
             _normalize_id(d.get("payer_id", ""), "payer"),
             pids,
