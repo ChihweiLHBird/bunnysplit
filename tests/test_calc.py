@@ -476,6 +476,40 @@ class FromDictBoundaryTests(unittest.TestCase):
         self.assertEqual([person.id for person in state.people], ["a"])
         self.assertEqual(state.items[0].participant_ids, ["a"])
 
+    def test_ids_with_a_nul_character_are_skipped_and_reported(self):
+        # MicroPython's jsffi cuts a str at its first NUL when it reaches JS,
+        # so the DOM would hold "b" for a person whose id is "b\x00": adding
+        # an item would then record a participant or payer nobody has, or
+        # another person's id, and lose that share.
+        issues = []
+        raw = {
+            "people": [
+                {"id": "a", "name": "A"},
+                {"id": "b\x00", "name": "B"},
+                {"id": "a\x00b", "name": "Also B"},
+            ],
+            "items": [
+                {"id": "i1", "description": "kept", "amount_cents": 100,
+                 "payer_id": "a", "participant_ids": ["a", "b\x00"],
+                 "split": {"mode": "equal"}},
+                {"id": "i2", "description": "bad payer", "amount_cents": 100,
+                 "payer_id": "a\x00", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+                {"id": "i3\x00", "description": "bad id", "amount_cents": 100,
+                 "payer_id": "a", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+            ],
+        }
+
+        state = AppState.from_dict(
+            raw, on_issue=lambda kind, message: issues.append((kind, message)))
+
+        self.assertEqual([p.id for p in state.people], ["a"])
+        self.assertEqual([it.id for it in state.items], ["i1"])
+        self.assertEqual(state.items[0].participant_ids, ["a"])
+        self.assertEqual(
+            sum("NUL" in message for _, message in issues), 5, issues)
+
     def test_unknown_split_mode_normalized_to_equal(self):
         raw = {
             "people": self._people(),
@@ -597,12 +631,12 @@ class SplitSanitizingTests(unittest.TestCase):
     whole bill. split_item() already treats a non-finite weight as 0, so
     dropping one does not change the computed split."""
 
-    def _state(self, split):
+    def _state(self, split, ids="ab"):
         issues = []
         state = AppState.from_dict(
-            {"people": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}],
+            {"people": [{"id": pid, "name": pid.upper()} for pid in ids],
              "items": [{"id": "i", "description": "x", "amount_cents": 1000,
-                        "payer_id": "a", "participant_ids": ["a", "b"],
+                        "payer_id": "a", "participant_ids": list(ids),
                         "split": split}]},
             on_issue=lambda kind, message: issues.append((kind, message)))
         return state, issues
@@ -645,10 +679,27 @@ class SplitSanitizingTests(unittest.TestCase):
         weights = {"a": 1, "b": "2", "c": 0.5, "d": True, "e": None,
                    "f": "7" * 1000}
 
-        state, issues = self._state(uneven(dict(weights)))
+        state, issues = self._state(uneven(dict(weights)), ids="abcdef")
 
         self.assertEqual(state.items[0].weights(), {"a": 1, "c": 0.5})
         self.assertEqual(len(issues), 4)
+        self.assert_strict_json(state)
+
+    def test_weights_for_non_participants_are_dropped_with_one_issue(self):
+        # split_item() reads only participants' weights, and the app writes
+        # no others. Under MicroPython, building one dict is superlinear in
+        # its key count: 40,000 extra keys fit a 380 KiB backup and made
+        # every later page load take ~12 s. Reporting each key would also
+        # flood the console, so the extra keys are one issue per item.
+        weights = {"a": 1, "b": 2, "x": 1, "y": None, "z": "7"}
+        before = split_item(item(1000, ["a", "b"], split=uneven(dict(weights))))
+
+        state, issues = self._state(uneven(dict(weights)))
+
+        self.assertEqual(state.items[0].weights(), {"a": 1, "b": 2})
+        self.assertEqual(split_item(state.items[0]), before)
+        self.assertEqual(issues,
+                         [("item", "dropped 3 weights for non-participants")])
         self.assert_strict_json(state)
 
     def test_unknown_split_fields_are_dropped(self):

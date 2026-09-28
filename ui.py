@@ -884,9 +884,16 @@ def start(state, storage_module):
     _qs("#item-desc").maxLength = MAX_DESCRIPTION_LENGTH
     _on(_qs("#add-person"), "click", on_add_person, track=False)
     _on(_qs("#add-item"), "click", on_add_item, track=False)
-    _on(_qs("#export-state"), "click", on_export_state, track=False)
-    _on(_qs("#import-state"), "click", on_import_click, track=False)
-    _on(_qs("#import-file"), "change", on_import_file_change, track=False)
+    # The Backup panel is newer than the rest of the page. During a service
+    # worker update this ui.py can run under the cached older index.html,
+    # which must still render the bill; the panel appears on the next load.
+    for sel, event, handler in (
+            ("#export-state", "click", on_export_state),
+            ("#import-state", "click", on_import_click),
+            ("#import-file", "change", on_import_file_change)):
+        node = _qs(sel)
+        if node is not None:
+            _on(node, event, handler, track=False)
     parts = _qs("#participants")
     _on(parts, "focusin", _select_share_field, track=False)
     render_all()

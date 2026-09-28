@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import types
 import unittest
@@ -442,6 +443,18 @@ class BackupFormatTests(unittest.TestCase):
         self.assertEqual([person.name for person in state.people], ["A"])
         self.assertEqual(len(issues), 1)
 
+    def test_escaped_nul_in_an_id_is_skipped_and_reported(self):
+        # \u0000 has four hex digits, so it passes the escape check; the id
+        # it decodes into must not reach the DOM (see the model test).
+        text = ('{"people":[{"id":"p1","name":"Ann"},'
+                '{"id":"p2\\u0000","name":"Bob"}],"items":[]}')
+
+        state, issues = self.storage.parse_backup(text)
+
+        self.assertEqual([person.id for person in state.people], ["p1"])
+        self.assertEqual(len(issues), 1)
+        self.assertIn("NUL", issues[0])
+
 
 class FakeClassList:
     def __init__(self):
@@ -630,6 +643,63 @@ class UiBoundaryTests(unittest.TestCase):
                 self.assertEqual(ui._fmt_weight(weight), shown)
 
 
+class DomElement(FakeElement):
+    """Enough of an element for start() and render_all()."""
+
+    def __init__(self, tag=""):
+        super().__init__(tag)
+        self.style = types.SimpleNamespace(setProperty=lambda name, value: None)
+        self.classList = FakeClassList()
+        self.listeners = []
+        self.removed = False
+
+    @property
+    def firstChild(self):
+        return self.children[0] if self.children else None
+
+    def setAttribute(self, name, value):
+        pass
+
+    def addEventListener(self, event, handler):
+        self.listeners.append(event)
+
+    def remove(self):
+        self.removed = True
+
+
+class DomDocument(FakeDocument):
+    def createElement(self, tag):
+        return DomElement(tag)
+
+
+class OutdatedShellTests(unittest.TestCase):
+    def test_start_renders_the_saved_bill_without_the_backup_panel(self):
+        # A service-worker update can run this ui.py under the cached
+        # index.html from before the Backup panel existed. The bill must
+        # still render; the panel shows up on the next load.
+        ids = set(re.findall(r'\bid="([^"]+)"',
+                             (ROOT / "index.html").read_text()))
+        backup_ids = {"export-state", "import-state", "import-file",
+                      "backup-status"}
+        self.assertLessEqual(backup_ids, ids)
+        elements = {"#" + i: DomElement() for i in ids - backup_ids}
+        elements[".saved-pill"] = FakePill()
+        ui = load_ui(FakePill())
+        ui.document = DomDocument(elements)
+        state = AppState(
+            people=[Person("p1", "Ann"), Person("p2", "Bob")],
+            items=[Item("i1", "Dinner", 3000, "p1", ["p1", "p2"],
+                        {"mode": "equal"})])
+
+        ui.start(state, load_storage(FakeLocalStorage()))
+
+        self.assertTrue(elements["#boot-msg"].removed)
+        self.assertEqual(len(elements["#people-list"].children), 2)
+        self.assertEqual(len(elements["#items-list"].children), 1)
+        self.assertEqual(elements["#kpi-total"].textContent, "$30.00")
+        self.assertEqual(ui.window.console.warnings, [])
+
+
 BACKUP = json.dumps({
     "people": [{"id": "p1", "name": "A"}],
     "items": [{
@@ -736,6 +806,27 @@ class ImportExportTests(unittest.TestCase):
         state = reloaded.load()
         self.assertEqual(len(state.items), 1)
         self.assertEqual(reloaded.recovery_warning(), "")
+
+    def test_weights_for_non_participants_are_reported_and_not_saved(self):
+        # Every later page load parses the saved bill again, so keys the
+        # split never reads must not be kept.
+        weights = {"p1": 1, "p2": 3}
+        weights.update(("x%d" % n, 1) for n in range(1000))
+        text = json.dumps({
+            "people": [{"id": "p1", "name": "A"}, {"id": "p2", "name": "B"}],
+            "items": [{"id": "i1", "description": "x", "amount_cents": 400,
+                       "payer_id": "p1", "participant_ids": ["p1", "p2"],
+                       "split": {"mode": "uneven", "weights": weights}}],
+        })
+
+        self.import_text(text)
+
+        self.assertEqual(self.saved()["items"][0]["split"],
+                         {"mode": "uneven", "weights": {"p1": 1, "p2": 3}})
+        self.assertEqual(
+            self.status.textContent,
+            "Imported 2 people and 1 item. 1 problem was fixed or skipped; "
+            "see the browser console for details.")
 
     def test_import_into_an_empty_bill_applies_without_asking(self):
         field = self.import_text(BACKUP)

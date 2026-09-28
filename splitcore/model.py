@@ -77,6 +77,11 @@ def _normalize_id(value, kind):
         raise ValueError(kind + " id is empty")
     if len(identifier) > MAX_ID_LENGTH:
         raise ValueError(kind + " id exceeds %d characters" % MAX_ID_LENGTH)
+    # MicroPython's jsffi cuts a str at its first NUL when it reaches JS, so
+    # the DOM would hold another id ("p2" for "p2\x00", or another person's)
+    # and the UI would record shares for the wrong person or for nobody.
+    if "\x00" in identifier:
+        raise ValueError(kind + " id contains a NUL character")
     return identifier
 
 
@@ -173,6 +178,10 @@ class Item:
         # and reload: one non-finite number would make the saved JSON
         # unparseable and lose the whole bill. split_item() already treats
         # a non-finite weight as 0, so dropping one leaves the split as is.
+        # It reads only participants' weights, and the UI writes no others;
+        # extra keys would be parsed again on every load, and building a
+        # big dict is superlinear under MicroPython (40,000 keys made each
+        # page load take ~12 s), so drop them with a single issue.
         clean = {"mode": split["mode"]}
         if split["mode"] == MODE_UNEVEN and "weights" in split:
             weights = split["weights"]
@@ -180,12 +189,18 @@ class Item:
                 _report_issue(on_issue, "item", "weights is not an object")
                 weights = {}
             clean["weights"] = {}
+            extra = 0
             for pid, weight in weights.items():
-                if _valid_weight(weight):
+                if pid not in seen:
+                    extra += 1
+                elif _valid_weight(weight):
                     clean["weights"][pid] = weight
                 else:
                     _report_issue(on_issue, "item",
                                   "dropped invalid weight for '%s'" % pid)
+            if extra:
+                _report_issue(on_issue, "item",
+                              "dropped %d weights for non-participants" % extra)
         if len(clean) != len(split):
             _report_issue(on_issue, "item", "dropped unknown split fields")
         split = clean
