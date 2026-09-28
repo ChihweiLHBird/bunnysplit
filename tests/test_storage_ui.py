@@ -348,8 +348,10 @@ class BackupFormatTests(unittest.TestCase):
         self.assertEqual(issues, [])
 
     def test_participant_entries_are_limited_across_items(self):
-        pids = ["p%d" % i for i in range(MAX_PARTICIPANT_REFS // 10 + 1)]
-        items = [{"id": "i%d" % i, "participant_ids": pids} for i in range(10)]
+        # Each item within its own limit (one entry per person).
+        pids = ["p%d" % i for i in range(MAX_PEOPLE)]
+        items = [{"id": "i%d" % i, "participant_ids": pids}
+                 for i in range(MAX_PARTICIPANT_REFS // MAX_PEOPLE + 1)]
 
         with mock.patch.object(self.storage.AppState, "from_dict") as from_dict:
             with self.assertRaises(ValueError) as ctx:
@@ -399,7 +401,159 @@ class BackupFormatTests(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 self.storage.parse_backup(text)
 
-        self.assertIn("too large to back up", str(ctx.exception))
+        self.assertIn("once restored", str(ctx.exception))
+        self.assertNotIn("back up", str(ctx.exception))
+
+    def test_a_compact_file_is_refused_with_its_size_once_restored(self):
+        # The app writes ", " and ": " separators, so a minified backup grows
+        # when restored: this one meets the limit but its restored bill does
+        # not. The message must not cite a limit the file already meets.
+        raw = {"people": [{"id": "p%d" % i, "name": "P%d" % i}
+                          for i in range(78)], "items": []}
+        text = json.dumps(raw, separators=(",", ":"))
+
+        with mock.patch.object(self.storage, "MAX_BACKUP_BYTES", 2048):
+            self.assertLessEqual(len(text.encode()), 2048)
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(text)
+
+        self.assertEqual(
+            str(ctx.exception),
+            "That backup would be 3 KiB once restored, over the 2 KiB limit.")
+
+    def test_a_bill_at_every_limit_round_trips(self):
+        pids = ["p%d" % i for i in range(MAX_PEOPLE)]
+        people = [Person(pid, "n" * MAX_NAME_LENGTH) for pid in pids]
+        items = [Item("i0", "d" * MAX_DESCRIPTION_LENGTH, 100, "p0", pids,
+                      {"mode": "uneven",
+                       "weights": {pid: 1.5 for pid in pids}})]
+        # The other items share the remaining participant entries exactly.
+        rest = MAX_PARTICIPANT_REFS - MAX_PEOPLE
+        per_item, extra = divmod(rest, MAX_ITEMS - 1)
+        for i in range(1, MAX_ITEMS):
+            count = per_item + (1 if i <= extra else 0)
+            items.append(Item("i%d" % i, "x", 100, "p0", pids[:count],
+                              {"mode": "equal"}))
+        state = AppState(people=people, items=items)
+        self.assertEqual(sum(len(i.participant_ids) for i in items),
+                         MAX_PARTICIPANT_REFS)
+
+        restored, issues = self.storage.parse_backup(
+            self.storage.check_restorable(state))
+
+        self.assertEqual(restored.to_dict(), state.to_dict())
+        self.assertEqual(issues, [])
+
+    def test_an_item_with_more_participants_than_people_is_rejected(self):
+        # MicroPython's str hash is 16 bits and its sets probe linearly, so
+        # Item.from_dict()'s dedup set is quadratic in one item's ids when
+        # they share a hash: 20,000 of them, within the total limit, froze
+        # an import for ~10 s. No item can have more participants than the
+        # roster has people.
+        pids = ["p%d" % i for i in range(MAX_PEOPLE + 1)]
+        raw = {"people": [], "items": [{"id": "i1", "participant_ids": pids}]}
+
+        with mock.patch.object(self.storage.AppState, "from_dict") as from_dict:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(json.dumps(raw))
+
+        from_dict.assert_not_called()
+        self.assertEqual(str(ctx.exception),
+                         "A backup item can have at most %d participants."
+                         % MAX_PEOPLE)
+
+    def test_an_item_with_more_weights_than_people_is_rejected(self):
+        weights = {"p%d" % i: 1 for i in range(MAX_PEOPLE + 1)}
+        raw = {"people": [], "items": [{
+            "id": "i1", "participant_ids": ["p0"],
+            "split": {"mode": "uneven", "weights": weights}}]}
+
+        with mock.patch.object(self.storage.AppState, "from_dict") as from_dict:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(json.dumps(raw))
+
+        from_dict.assert_not_called()
+        self.assertEqual(str(ctx.exception),
+                         "A backup item can have at most %d split weights."
+                         % MAX_PEOPLE)
+
+    def test_objects_with_too_many_members_are_rejected_before_parsing(self):
+        # json.loads builds an object whose keys share a MicroPython hash in
+        # quadratic time (47,000 keys in an ignored field took ~30 s), before
+        # any check on the parsed value can run. MicroPython's json.loads
+        # also reads ',' and ':' as whitespace, lets ']' close '{' and takes
+        # any value as a key, so members are counted as values, not colons.
+        limit = self.storage.MAX_OBJECT_MEMBERS
+        head = '{"people": [], "items": [], "x": {'
+        members = ['"k%d": 0' % i for i in range(limit + 1)]
+        cases = {
+            "top level": '{"people": [], "items": [], %s}' % ", ".join(
+                members[:limit - 1]),
+            "nested": head + ", ".join(members) + "}}",
+            "object values": head + ", ".join(
+                '"k%d": {}' % i for i in range(limit + 1)) + "}}",
+            "after a nested value": head + '"a": [[[1]]], ' + ", ".join(
+                members) + "}}",
+            "no colons or commas": '{"people" [] "items" [] "x" {' + " ".join(
+                '"k%d" 0' % i for i in range(limit + 1)) + "}}",
+            "number keys, no separators": '{"people" [] "items" [] "x" {'
+                + "".join("%dtrue" % i for i in range(limit + 1)) + "}}",
+            "closed by a bracket": head + ", ".join(members) + "]}",
+            "never closed": head + ", ".join(members),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                with mock.patch.object(self.storage.json, "loads") as loads:
+                    with self.assertRaises(ValueError) as ctx:
+                        self.storage.parse_backup(text)
+                loads.assert_not_called()
+                self.assertEqual(
+                    str(ctx.exception), "That file has an object with too "
+                    "many fields to be a bunnysplit backup.")
+
+    def test_objects_at_the_member_limit_are_parsed(self):
+        limit = self.storage.MAX_OBJECT_MEMBERS
+        self.assertGreaterEqual(limit, MAX_PEOPLE)  # one weight per person
+        extra = ", ".join('"k%d": {}' % i for i in range(limit - 2))
+        nested = ", ".join('"k%d": 0' % i for i in range(limit))
+
+        for text in ('{"people": [], "items": [], %s}' % extra,
+                     '{"people": [], "items": [], "x": {%s}}' % nested):
+            state, issues = self.storage.parse_backup(text)
+            self.assertEqual(issues, [])
+
+    def test_too_many_objects_and_lists_are_rejected_before_parsing(self):
+        # Counting members walks every '{' and '[' in Python, which is slow
+        # under MicroPython; json.loads itself reads 512 KiB of them in ~40 ms.
+        limit = self.storage.MAX_CONTAINERS
+
+        def backup(lists):
+            # The top object, "people", "items" and "x": four containers.
+            return ('{"people": [], "items": [], "x": [%s]}'
+                    % ", ".join(["[]"] * (lists - 4)))
+
+        self.storage.parse_backup(backup(limit))
+        with mock.patch.object(self.storage.json, "loads") as loads:
+            with self.assertRaises(ValueError) as ctx:
+                self.storage.parse_backup(backup(limit + 1))
+
+        loads.assert_not_called()
+        self.assertEqual(str(ctx.exception), "That file has too many objects "
+                         "and lists to be a bunnysplit backup.")
+
+    def test_text_json_would_reject_is_refused_before_parsing(self):
+        # The member count relies on every character outside strings being
+        # one json.loads accepts; anything else makes json.loads fail anyway.
+        for text in ('{"people": [], "items": [], "x": NaN}',
+                     '{"people": [], "items": []} x',
+                     '{"people": [], "items": [], "x": nul}'):
+            with self.subTest(text=text):
+                with mock.patch.object(self.storage.json, "loads") as loads:
+                    with self.assertRaises(ValueError) as ctx:
+                        self.storage.parse_backup(text)
+                loads.assert_not_called()
+                self.assertEqual(str(ctx.exception),
+                                 "That file isn't valid JSON.")
 
     def test_check_restorable_returns_the_export_text(self):
         state = AppState(people=[Person("p1", "A")])
@@ -772,6 +926,23 @@ class ImportExportTests(unittest.TestCase):
         self.assertIn("Names can be at most", self.status.textContent)
         self.assertEqual(self.status.className, "error")
 
+    def test_export_flag_for_an_oversized_bill_does_not_contradict_it(self):
+        # The file was just downloaded, so "too large to back up" would be
+        # wrong; say how large the file is instead.
+        self.ui._state = AppState(people=[
+            Person("p%d" % i, "P%d" % i) for i in range(50)])
+        size = len(self.ui._storage.dumps(self.ui._state).encode())
+        self.assertTrue(1024 < size <= 2048, size)
+
+        with mock.patch.object(self.ui._storage, "MAX_BACKUP_BYTES", 1024):
+            self.ui.on_export_state(None)
+
+        self.assertEqual(self.ui.document.body.appended[0].click_count, 1)
+        self.assertEqual(self.status.textContent,
+                         "Exported, but this app can't restore that file: "
+                         "it is 2 KiB, over the 1 KiB limit.")
+        self.assertEqual(self.status.className, "error")
+
     def test_import_with_an_over_long_name_is_rejected(self):
         original = AppState(people=[Person("p1", "Keep me")])
         self.ui._state = original
@@ -811,7 +982,7 @@ class ImportExportTests(unittest.TestCase):
         # Every later page load parses the saved bill again, so keys the
         # split never reads must not be kept.
         weights = {"p1": 1, "p2": 3}
-        weights.update(("x%d" % n, 1) for n in range(1000))
+        weights.update(("x%d" % n, 1) for n in range(MAX_PEOPLE - 2))
         text = json.dumps({
             "people": [{"id": "p1", "name": "A"}, {"id": "p2", "name": "B"}],
             "items": [{"id": "i1", "description": "x", "amount_cents": 400,

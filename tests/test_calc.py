@@ -3,6 +3,8 @@
     python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -331,7 +333,59 @@ class HardeningTests(unittest.TestCase):
             on_issue=lambda kind, message: issues.append((kind, message)))
 
         self.assertEqual(state.items[0].amount_cents, 0)
-        self.assertEqual(issues, [("item", "amount_cents is missing")])
+        self.assertEqual(issues,
+                         [("item", "amount_cents is missing; set to 0")])
+
+    def test_console_lines_say_whether_a_record_was_fixed_or_skipped(self):
+        # Import points users to the browser console for details, so each
+        # line must name its record and tell a record kept with a change
+        # ("fixed") from one left out of the bill ("skipped").
+        raw = {
+            "people": [{"id": "a", "name": "Ann"}, {"id": "b", "name": "Bob"},
+                       {"id": "a", "name": "Again"}],
+            "items": [
+                {"id": "i1", "description": "Rent", "payer_id": "a",
+                 "participant_ids": ["a"], "split": {"mode": "equal"}},
+                {"id": "i2", "description": "Car",
+                 "amount_cents": MAX_CENTS + 1, "payer_id": "a",
+                 "participant_ids": ["a"], "split": {"mode": "equal"}},
+                {"id": "i3", "description": "Hotel", "amount_cents": 500,
+                 "payer_id": "a", "participant_ids": ["a", "b", "a"],
+                 "split": {"mode": "uneven",
+                           "weights": {"a": "2", "b": 1, "q": 5}}},
+                {"id": "i4", "description": "Taxi", "amount_cents": 300,
+                 "payer_id": "a", "participant_ids": ["a", "zz"],
+                 "split": {"mode": "equal"}},
+                {"id": "i5", "description": "Ghost", "amount_cents": 100,
+                 "payer_id": "zz", "participant_ids": ["a"],
+                 "split": {"mode": "equal"}},
+            ],
+        }
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            state = AppState.from_dict(raw)
+
+        self.assertEqual([it.id for it in state.items],
+                         ["i1", "i2", "i3", "i4"])
+        self.assertEqual(err.getvalue().splitlines(), [
+            "bunnysplit: skipped malformed person record 'a' (Again): "
+            "duplicate id 'a'",
+            "bunnysplit: fixed item record 'i1' (Rent): "
+            "amount_cents is missing; set to 0",
+            "bunnysplit: fixed item record 'i2' (Car): "
+            "amount_cents exceeds MAX_CENTS; set to MAX_CENTS",
+            "bunnysplit: skipped malformed participant record in item 'i3' "
+            "(Hotel): duplicate id 'a'",
+            "bunnysplit: fixed item record 'i3' (Hotel): "
+            "dropped invalid weight for 'a'",
+            "bunnysplit: fixed item record 'i3' (Hotel): "
+            "dropped 1 weight for non-participants",
+            "bunnysplit: fixed item record 'i4' (Taxi): "
+            "dropped unknown participants",
+            "bunnysplit: skipped malformed item record 'i5' (Ghost): "
+            "payer 'zz' not in roster",
+        ])
 
 
 class TextFieldTests(unittest.TestCase):

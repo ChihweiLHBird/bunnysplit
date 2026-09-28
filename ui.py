@@ -718,7 +718,8 @@ def on_export_state(event):
     # was saved. Always export, but flag a bill (e.g. saved before the
     # limits existed) that this app's import would refuse.
     try:
-        text = _storage.check_restorable(_state)
+        text = _storage.check_restorable(
+            _state, "it is %d KiB, over the %d KiB limit.")
         problem = None
     except ValueError as e:
         text = _storage.dumps(_state)
